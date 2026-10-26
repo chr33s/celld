@@ -6493,7 +6493,11 @@ fn op_names() -> impl Iterator<Item = &'static str> {
     let test = TEST_OP_NAMES.iter().copied();
     #[cfg(not(celld_internal_tests))]
     let test = std::iter::empty();
-    OP_NAMES.iter().copied().chain(test)
+    #[cfg(celld_workflow_failpoints)]
+    let failpoints = FAILPOINT_OP_NAMES.iter().copied();
+    #[cfg(not(celld_workflow_failpoints))]
+    let failpoints = std::iter::empty();
+    OP_NAMES.iter().copied().chain(test).chain(failpoints)
 }
 
 impl<'s> InternalArguments<'s> {
@@ -6526,6 +6530,8 @@ fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> InternalArguments<'s> {
     install_op_functions(scope, &mut functions);
     #[cfg(celld_internal_tests)]
     install_test_op_functions(scope, &mut functions);
+    #[cfg(celld_workflow_failpoints)]
+    install_failpoint_op_functions(scope, &mut functions);
     let mut functions = functions.into_iter();
     // Read-only: a test that assigns `__celld.__op = fn`, the idiom that
     // patching a global once allowed, throws instead of binding a script that
@@ -6766,6 +6772,7 @@ ops! { OP_NAMES, install_op_functions,
         "__d1_run" => storage_ops::op_d1_run,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
+        "__wf_rollback_event" => op_wf_rollback_event,
         "__storage_put" => storage_ops::op_storage_put,
         "__storage_put_many" => storage_ops::op_storage_put_many,
         "__storage_queue_put" => storage_ops::op_storage_queue_put,
@@ -10023,6 +10030,44 @@ fn op_process_exit(
     scope.terminate_execution();
 }
 
+/// One Workflow rollback lifecycle event, the node-log counterpart of what
+/// upstream emits to Workflows analytics. The harness calls it after the
+/// transition commits, so a crash can repeat an event but never report one
+/// that did not happen. It records the step and the error's name, never a
+/// step output or an error message: either can carry application data.
+fn op_wf_rollback_event(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let text = |index: i32| {
+        let value = args.get(index);
+        if value.is_undefined() {
+            String::new()
+        } else {
+            value.to_rust_string_lossy(scope)
+        }
+    };
+    let kind = text(0);
+    let workflow = text(1);
+    let instance = text(2);
+    let step = text(3);
+    let count = text(4);
+    let attempt = text(5);
+    let error = text(6);
+    tracing::info!(
+        event = "workflow_rollback",
+        kind = %kind,
+        workflow = %workflow,
+        instance = %instance,
+        step = %step,
+        count = %count,
+        attempt = %attempt,
+        error = %error,
+        "workflow rollback {kind}"
+    );
+}
+
 fn op_log(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -10307,6 +10352,66 @@ pub fn reset_queue_settlement_policy_observation_for_test() {
 #[doc(hidden)]
 pub fn queue_settlement_policy_observed_for_test() -> bool {
     QUEUE_SETTLEMENT_POLICY_OBSERVED.with(std::cell::Cell::get)
+}
+
+// Workflow durability failpoints for crash tests that restart a real node
+// (`crates/celld/tests/workflow_rollback.rs`). A build with
+// `--cfg celld_workflow_failpoints` turns each harness checkpoint into a
+// call of this op; a shipping build has neither the op nor the calls.
+#[cfg(celld_workflow_failpoints)]
+ops! { FAILPOINT_OP_NAMES, install_failpoint_op_functions,
+    "__test_workflow_failpoint" => op_test_workflow_failpoint,
+}
+
+/// Fire the failpoint named by the argument when the file named by
+/// `CELLD_TEST_WORKFLOW_FAILPOINTS` arms it with a `<name> <crash|storage>`
+/// line. The line is removed and synced before the action, so an armed crash
+/// fires once and the restarted node runs past it. `crash` aborts the
+/// process mid-checkpoint as a SIGKILL would; `storage` throws the storage
+/// error a failed commit raises.
+#[cfg(celld_workflow_failpoints)]
+#[allow(clippy::disallowed_methods)]
+fn op_test_workflow_failpoint(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    use std::io::Write as _;
+    let name = args.get(0).to_rust_string_lossy(scope);
+    let Some(path) = std::env::var_os("CELLD_TEST_WORKFLOW_FAILPOINTS") else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut action = None;
+    let mut rest = String::new();
+    for line in text.lines() {
+        match line.split_once(' ') {
+            Some((point, armed)) if action.is_none() && point == name => {
+                action = Some(armed.trim().to_owned());
+            }
+            _ => {
+                rest.push_str(line);
+                rest.push('\n');
+            }
+        }
+    }
+    let Some(action) = action else {
+        return;
+    };
+    let mut file = std::fs::File::create(&path).expect("rewrite the failpoint file");
+    file.write_all(rest.as_bytes()).expect("rewrite the failpoint file");
+    file.sync_all().expect("sync the failpoint file");
+    match action.as_str() {
+        "crash" => std::process::abort(),
+        "storage" => throw_storage_error(
+            scope,
+            "workflow failpoint",
+            format!("injected failure at {name}"),
+        ),
+        other => panic!("unknown workflow failpoint action {other:?} for {name}"),
+    }
 }
 
 #[cfg(celld_internal_tests)]

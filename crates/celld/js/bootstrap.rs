@@ -116,7 +116,10 @@ static POST_HARNESS: &[BootstrapSource] = &[
 // one external buffer in the binary and checks the ASCII requirement at
 // compile time. Compiled code and the objects created by the script remain
 // isolate-local; this shares only the original source buffer.
-#[cfg(any(not(celld_internal_tests), all(test, celld_internal_tests)))]
+#[cfg(any(
+    all(not(celld_internal_tests), not(celld_workflow_failpoints)),
+    all(test, celld_internal_tests)
+))]
 static HARNESS_SOURCE: v8::OneByteConst =
     v8::String::create_external_onebyte_const(HARNESS.as_bytes());
 
@@ -130,7 +133,30 @@ fn bootstrap_code_cache() -> &'static std::sync::Mutex<BootstrapCache> {
     CACHE.get_or_init(Default::default)
 }
 
-#[cfg(celld_internal_tests)]
+/// The Workflow durability checkpoints a `celld_workflow_failpoints` build
+/// can crash or fail at. Each names a `/*__CELLD_TEST_WORKFLOW_FAILPOINT:*/`
+/// marker in harness.js; a shipping build leaves the markers as comments.
+#[cfg(celld_workflow_failpoints)]
+const WORKFLOW_FAILPOINTS: &[&str] = &[
+    "forward.after_callback",
+    "rollback.requested",
+    "rollback.running_commit",
+    "rollback.before_handler",
+    "rollback.after_handler",
+    "rollback.after_step",
+    "rollback.before_finish",
+];
+
+#[cfg(celld_workflow_failpoints)]
+fn with_workflow_failpoints(harness: String) -> String {
+    WORKFLOW_FAILPOINTS.iter().fold(harness, |harness, name| {
+        let marker = format!("/*__CELLD_TEST_WORKFLOW_FAILPOINT:{name}__*/");
+        assert!(harness.contains(&marker), "harness.js lacks failpoint {name}");
+        harness.replace(&marker, &format!("__test_workflow_failpoint({name:?});"))
+    })
+}
+
+#[cfg(any(celld_internal_tests, celld_workflow_failpoints))]
 fn run_bootstrap_script<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &'static str,
@@ -242,7 +268,10 @@ pub(super) fn bootstrap_sources_for_test<'s>(
         .collect()
 }
 
-#[cfg(any(not(celld_internal_tests), all(test, celld_internal_tests)))]
+#[cfg(any(
+    all(not(celld_internal_tests), not(celld_workflow_failpoints)),
+    all(test, celld_internal_tests)
+))]
 fn shipping_harness_source<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::String> {
     v8::String::new_from_onebyte_const(scope, &HARNESS_SOURCE).expect("static harness source")
 }
@@ -293,9 +322,16 @@ pub(super) fn install_harness<'s>(
                 "await this.__wfPause(); globalThis.__test_workflow_release(); }"
             ),
         );
+    #[cfg(all(celld_internal_tests, celld_workflow_failpoints))]
+    let harness = with_workflow_failpoints(harness);
     #[cfg(celld_internal_tests)]
     run_bootstrap_script(scope, "harness.js", harness.as_str(), arguments)?;
-    #[cfg(not(celld_internal_tests))]
+    #[cfg(all(not(celld_internal_tests), celld_workflow_failpoints))]
+    {
+        let harness = with_workflow_failpoints(HARNESS.to_owned());
+        run_bootstrap_script(scope, "harness.js", harness.as_str(), arguments)?;
+    }
+    #[cfg(not(any(celld_internal_tests, celld_workflow_failpoints)))]
     {
         let harness = shipping_harness_source(scope);
         run_internal_script(scope, Some("harness.js"), harness, arguments)?;
