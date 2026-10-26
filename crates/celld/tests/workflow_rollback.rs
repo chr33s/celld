@@ -41,6 +41,7 @@ struct Node {
     _dir: tempfile::TempDir,
     project: PathBuf,
     failpoints: PathBuf,
+    token: String,
     port: u16,
     supervisor: Option<Child>,
 }
@@ -56,11 +57,20 @@ impl Node {
         }
         let failpoints = dir.path().join("failpoints");
         std::fs::write(&failpoints, "").expect("create the failpoint file");
+        let token = dir
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a temporary directory name")
+            .to_owned();
+        std::fs::write(project.join(".dev.vars"), format!("NODE_TOKEN={token}\n"))
+            .expect("write the node token");
         let port = free_port();
         let mut node = Self {
             _dir: dir,
             project,
             failpoints,
+            token,
             port,
             supervisor: None,
         };
@@ -68,7 +78,21 @@ impl Node {
         node
     }
 
+    /// Start `celld dev` and wait until this node, identified by its token,
+    /// answers. Another test can take a port this node released, so a start
+    /// whose supervisor exits early retries on a fresh port; the local state
+    /// lives in the project, not behind the port.
     fn spawn(&mut self, clean: bool) {
+        for _ in 0..3 {
+            if self.try_spawn(clean) {
+                return;
+            }
+            self.port = free_port();
+        }
+        panic!("celld dev did not start\n{}", self.log_tail());
+    }
+
+    fn try_spawn(&mut self, clean: bool) -> bool {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -86,29 +110,48 @@ impl Node {
         if clean {
             command.arg("--clean");
         }
-        self.supervisor = Some(command.spawn().expect("start celld dev"));
+        let mut supervisor = command.spawn().expect("start celld dev");
         let deadline = Instant::now() + Duration::from_secs(120);
         while Instant::now() < deadline {
-            if self.try_get("/ready").is_some_and(|body| body == "not found") {
-                return;
+            if self.try_get("/whoami").as_deref() == Some(self.token.as_str()) {
+                self.supervisor = Some(supervisor);
+                return true;
+            }
+            if supervisor.try_wait().expect("poll the supervisor").is_some() {
+                return false;
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        panic!("celld dev did not start; see {}", self.project.join("node.log").display());
+        let _ = supervisor.kill();
+        let _ = supervisor.wait();
+        false
+    }
+
+    fn log_tail(&self) -> String {
+        let log = std::fs::read_to_string(self.project.join("node.log")).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        lines[lines.len().saturating_sub(40)..].join("\n")
     }
 
     /// Stop the supervisor and the node it started. The node runs in its own
-    /// process group, and its command line names the listener port.
+    /// process group, so it is found as the supervisor's child and killed by
+    /// pid; matching its command line could hit another test's node that
+    /// took over a port this one released.
     fn kill(&mut self) {
         if let Some(mut supervisor) = self.supervisor.take() {
+            let children = Command::new("pgrep")
+                .args(["-P", &supervisor.id().to_string()])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .unwrap_or_default();
+            for pid in children.split_whitespace() {
+                let _ = Command::new("kill").args(["-9", pid]).status();
+            }
             let _ = supervisor.kill();
             let _ = supervisor.wait();
         }
-        let _ = Command::new("pkill")
-            .args(["-9", "-f", &format!("listen 127.0.0.1:{} ", self.port)])
-            .status();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while self.try_get("/ready").is_some() && Instant::now() < deadline {
+        while self.answers() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -124,7 +167,7 @@ impl Node {
     #[cfg(celld_workflow_failpoints)]
     fn restart_after_crash(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(30);
-        while self.try_get("/ready").is_some() {
+        while self.answers() {
             assert!(Instant::now() < deadline, "the armed failpoint did not crash the node");
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -163,6 +206,75 @@ impl Node {
     fn try_get(&self, path: &str) -> Option<String> {
         http_get(self.port, path)
     }
+
+    /// Whether this node, not merely some process on its port, answers.
+    fn answers(&self) -> bool {
+        self.try_get("/whoami").as_deref() == Some(self.token.as_str())
+    }
+
+    fn node_log(&self) -> String {
+        std::fs::read_to_string(self.project.join("node.log")).expect("read the node log")
+    }
+
+    /// The operator listener of the running node, from its startup line.
+    fn internal_port(&self) -> u16 {
+        let log = self.node_log();
+        let line = log
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("celld internal listening on 127.0.0.1:"))
+            .expect("the node announced its internal listener");
+        line["celld internal listening on 127.0.0.1:".len()..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|port| port.parse().ok())
+            .expect("an internal port")
+    }
+
+    fn state(&self) -> Value {
+        let body = http_get(self.internal_port(), "/state").expect("read the node state");
+        serde_json::from_str(&body).expect("node state JSON")
+    }
+
+    /// Send a request and hang up before it answers, as a client that gives
+    /// up or a cancelled fetch does.
+    fn cancel_get(&self, path: &str, after: Duration) {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        )
+        .expect("send the request");
+        std::thread::sleep(after);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Ask the supervisor to stop, as Ctrl-C does, and return how long the
+    /// node took to drain and exit.
+    fn stop_gracefully(&mut self) -> Duration {
+        let mut supervisor = self.supervisor.take().expect("a running supervisor");
+        let started = Instant::now();
+        let _ = Command::new("kill")
+            .args(["-INT", &supervisor.id().to_string()])
+            .status();
+        let deadline = started + Duration::from_secs(60);
+        while supervisor.try_wait().expect("poll the supervisor").is_none() {
+            assert!(Instant::now() < deadline, "celld dev did not stop");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        started.elapsed()
+    }
+}
+
+/// Parse `2026-10-26T04:22:41.416625Z` into milliseconds within the day,
+/// enough to measure the gaps between attempts of one test run.
+fn log_millis(line: &str) -> Option<f64> {
+    let time = line.split('T').nth(1)?.split('Z').next()?;
+    let mut parts = time.split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    Some(((hours * 60.0 + minutes) * 60.0 + seconds) * 1000.0)
 }
 
 fn rollback_events(log: &str, id: &str) -> Vec<String> {
@@ -243,7 +355,11 @@ impl Node {
             if !["queued", "running", "waiting"].contains(&state) {
                 return status;
             }
-            assert!(Instant::now() < deadline, "{id} did not settle: {status}");
+            assert!(
+                Instant::now() < deadline,
+                "{id} did not settle: {status}\n{}",
+                self.log_tail()
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -325,8 +441,8 @@ fn rollback_behaviour() {
         ("terminate-plain", "sleeper"),
         ("terminate-null", "sleeper"),
         ("in-flight", "in-flight"),
-        ("rpc-fence", "slow-undo"),
-        ("delete-mid", "slow-undo"),
+        ("rpc-fence", "held-undo"),
+        ("delete-mid", "held-undo"),
     ] {
         scenario(id, name);
     }
@@ -460,14 +576,20 @@ fn rollback_behaviour() {
     assert_eq!(node.status("terminate-null")["status"], "terminated");
 
     // A terminate under a running step waits for it; its late result is
-    // fenced, so its compensator receives undefined.
+    // fenced, so its compensator receives undefined. The step is held until
+    // the terminate has landed.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while node.forward_runs("in-flight", "a") == 0 {
+    while node.forward_runs("in-flight", "slow") == 0 {
         assert!(Instant::now() < deadline, "in-flight never started");
         std::thread::sleep(Duration::from_millis(50));
     }
-    std::thread::sleep(Duration::from_millis(300));
-    node.call("/terminate?options=%7B%22rollback%22%3Atrue%7D", "in-flight");
+    let port = node.port;
+    let terminating = std::thread::spawn(move || {
+        http_get(port, "/terminate?options=%7B%22rollback%22%3Atrue%7D&id=in-flight")
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    node.call("/allow", "in-flight");
+    terminating.join().expect("the terminate call");
     assert_eq!(node.settled("in-flight")["rollback"], rollback("complete"));
     assert_eq!(
         node.undone("in-flight"),
@@ -475,9 +597,10 @@ fn rollback_behaviour() {
     );
 
     // While compensating: running status, fenced RPCs, and delete stops it.
+    // Both handlers for b are held until allowed.
     let deadline = Instant::now() + Duration::from_secs(30);
     while node.undone("rpc-fence").is_empty() || node.undone("delete-mid").is_empty() {
-        assert!(Instant::now() < deadline, "slow-undo never started compensating");
+        assert!(Instant::now() < deadline, "held-undo never started compensating");
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(
@@ -498,8 +621,11 @@ fn rollback_behaviour() {
         );
     }
     assert_eq!(node.call("/delete", "delete-mid"), serde_json::json!({ "ok": true }));
+    node.call("/allow", "rpc-fence");
+    node.call("/allow", "delete-mid");
     assert_eq!(node.settled("rpc-fence")["rollback"], rollback("complete"));
-    std::thread::sleep(Duration::from_millis(4000));
+    assert_eq!(steps(&node.undone("rpc-fence")), ["b", "a"]);
+    std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(steps(&node.undone("delete-mid")), ["b"]);
     assert!(node.status("delete-mid")["error"]
         .as_str()
@@ -551,6 +677,129 @@ fn code_drift_fails_closed() {
     node.call("/retry-rollback", "drift-missing");
     assert_eq!(node.settled("drift-missing")["rollback"], rollback("complete"));
     assert_eq!(steps(&node.undone("drift-missing")), ["a"]);
+}
+
+/// LOAD-01: many instances waiting out a rollback backoff at once. Each
+/// handler fails until allowed, with a 6-second backoff. The persisted
+/// deadlines must hold under load (no hot retry loop), the cells must share
+/// a bounded set of isolates, and every rollback must still finish.
+#[test]
+fn many_rollbacks_backing_off_stay_bounded() {
+    const INSTANCES: usize = 50;
+    const BACKOFF_MS: f64 = 6000.0;
+    let node = Node::start();
+    let ids: Vec<String> = (0..INSTANCES).map(|index| format!("load-{index}")).collect();
+    for id in &ids {
+        node.create(id, serde_json::json!({ "scenario": "backoff" }));
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while ids
+        .iter()
+        .any(|id| !node.events(id).iter().any(|event| event == "attempt_errored:a"))
+    {
+        assert!(Instant::now() < deadline, "not every rollback reached its backoff");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Every cell is owned, but the isolates that run them stay few.
+    let state = node.state();
+    let cells = state["deployment"]["cells"].as_object().unwrap();
+    let workflows = cells.keys().filter(|cell| cell.starts_with("__Workflow.")).count();
+    assert_eq!(workflows, INSTANCES);
+    let live = state["deployment"]["isolates"]["cells"]["workflow-rollback"]["live"]
+        .as_u64()
+        .unwrap();
+    assert!(live <= 8, "{live} live isolates for {INSTANCES} instances");
+
+    // Let one more round of retries fail, then allow the handlers.
+    std::thread::sleep(Duration::from_millis(BACKOFF_MS as u64 + 1000));
+    for id in &ids {
+        node.call("/allow", id);
+    }
+    for id in &ids {
+        assert_eq!(node.settled(id)["rollback"], rollback("complete"), "{id}");
+    }
+
+    // No attempt started before its persisted backoff elapsed.
+    let log = node.node_log();
+    for id in &ids {
+        let starts: Vec<f64> = log
+            .lines()
+            .filter(|line| line.contains("kind=attempt_started"))
+            .filter(|line| line.contains(&format!(" instance={id} ")))
+            .filter_map(log_millis)
+            .collect();
+        assert!(starts.len() >= 2, "{id} attempts: {starts:?}");
+        for pair in starts.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= BACKOFF_MS - 50.0,
+                "{id} retried after {} ms",
+                pair[1] - pair[0]
+            );
+        }
+    }
+}
+
+/// LIFE-01 (celld #289, #294): clients that hang up on terminate({rollback})
+/// and retryRollback() while they wait. The rollback must finish on its own,
+/// once, leave no stuck work on the instance, and let the node drain fast,
+/// also with a waiting call still open when it stops.
+#[test]
+fn cancelled_rollback_calls_leave_nothing_stuck() {
+    let mut node = Node::start();
+    for id in ["cancel-terminate", "drain-terminate"] {
+        node.create(id, serde_json::json!({ "scenario": "slow-sleeper" }));
+    }
+    node.create("cancel-retry", serde_json::json!({ "scenario": "halt" }));
+    for id in ["cancel-terminate", "drain-terminate"] {
+        node.wait_for_status(id, "waiting");
+    }
+    let terminate = "/terminate?options=%7B%22rollback%22%3Atrue%7D";
+
+    // Hang up while terminate({rollback: true}) waits on a 3-second handler.
+    node.cancel_get(&format!("{terminate}&id=cancel-terminate"), Duration::from_millis(300));
+    let status = node.settled("cancel-terminate");
+    assert_eq!(status["status"], "terminated");
+    assert_eq!(status["rollback"], rollback("complete"));
+    assert_eq!(steps(&node.undone("cancel-terminate")), ["a"]);
+
+    // Hang up while retryRollback() waits.
+    assert_eq!(node.settled("cancel-retry")["rollback"]["outcome"], "failed");
+    node.call("/allow", "cancel-retry");
+    node.cancel_get("/retry-rollback?id=cancel-retry", Duration::from_millis(50));
+    assert_eq!(node.settled("cancel-retry")["rollback"], rollback("complete"));
+    assert_eq!(steps(&node.undone("cancel-retry")), ["b", "b", "b", "a"]);
+
+    // Nothing is left pending on either instance: each answers at once,
+    // and the cancelled callers left no duplicate handler run behind.
+    std::thread::sleep(Duration::from_millis(3500));
+    for id in ["cancel-terminate", "cancel-retry"] {
+        let started = Instant::now();
+        node.status(id);
+        assert!(started.elapsed() < Duration::from_secs(2), "{id} status was slow");
+    }
+    assert_eq!(steps(&node.undone("cancel-terminate")), ["a"]);
+    assert_eq!(steps(&node.undone("cancel-retry")), ["b", "b", "b", "a"]);
+
+    // A terminate({rollback}) still waiting when the node stops cannot hold
+    // the drain to its deadline.
+    let port = node.port;
+    let waiting = std::thread::spawn(move || http_get(port, &format!("{terminate}&id=drain-terminate")));
+    std::thread::sleep(Duration::from_millis(300));
+    let stopped = node.stop_gracefully();
+    let _ = waiting.join();
+    assert!(stopped < Duration::from_secs(20), "the node took {stopped:?} to stop");
+    assert!(
+        !node.node_log().contains("drain reached its"),
+        "the drain hit its deadline"
+    );
+
+    // The interrupted rollback finishes after a restart.
+    node.spawn(false);
+    let status = node.settled("drain-terminate");
+    assert_eq!(status["status"], "terminated");
+    assert_eq!(status["rollback"], rollback("complete"));
+    assert!(!node.undone("drain-terminate").is_empty());
 }
 
 /// Crash at one checkpoint of the "chain" scenario (a, b with handlers, then
@@ -727,13 +976,22 @@ impl Fleet {
             assert!(Instant::now() < deadline, "MinIO did not start");
             std::thread::sleep(Duration::from_millis(200));
         }
-        let created = Command::new("curl")
-            .args(["-sf", "-X", "PUT", "--aws-sigv4", "aws:amz:us-east-1:s3", "--user"])
-            .arg(format!("{BUCKET_USER}:{BUCKET_SECRET}"))
-            .arg(format!("{}/celld-test", fleet.endpoint))
-            .status()
-            .expect("run curl");
-        assert!(created.success(), "could not create the bucket");
+        // The health probe can answer before the S3 API accepts requests.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let created = Command::new("curl")
+                .args(["-sf", "-X", "PUT", "--aws-sigv4", "aws:amz:us-east-1:s3", "--user"])
+                .arg(format!("{BUCKET_USER}:{BUCKET_SECRET}"))
+                .arg(format!("{}/celld-test", fleet.endpoint))
+                .stdout(Stdio::null())
+                .status()
+                .expect("run curl");
+            if created.success() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "could not create the bucket");
+            std::thread::sleep(Duration::from_millis(250));
+        }
 
         let project = fleet._dir.path().join("project");
         std::fs::create_dir(&project).expect("create the project directory");
@@ -836,7 +1094,7 @@ impl Drop for Fleet {
 fn fleet_failover_finishes_the_rollback() {
     let mut fleet = Fleet::start();
     let params = percent_encoding::utf8_percent_encode(
-        r#"{"scenario":"slow-undo"}"#,
+        r#"{"scenario":"held-undo"}"#,
         percent_encoding::NON_ALPHANUMERIC,
     )
     .to_string();
@@ -845,7 +1103,7 @@ fn fleet_failover_finishes_the_rollback() {
         serde_json::json!({ "ok": true })
     );
 
-    // Kill the owner while the slow handler of step b runs.
+    // Kill the owner while the handler of step b is held.
     let deadline = Instant::now() + Duration::from_secs(30);
     while !fleet.get(0, "/log?id=failover").to_string().contains(r#""step":"b""#) {
         assert!(Instant::now() < deadline, "the rollback never started");
@@ -854,6 +1112,13 @@ fn fleet_failover_finishes_the_rollback() {
     let owner = fleet.workflow_owner().expect("one node owns the Workflow cell");
     fleet.kill(owner);
     let survivor = 1 - owner;
+    // The Log object may have lived on the killed node too; it answers once
+    // its cell has moved.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while fleet.get(survivor, "/allow?id=failover") != serde_json::json!({ "ok": true }) {
+        assert!(Instant::now() < deadline, "the Log cell never moved to the survivor");
+        std::thread::sleep(Duration::from_millis(250));
+    }
 
     let deadline = Instant::now() + Duration::from_secs(90);
     let status = loop {

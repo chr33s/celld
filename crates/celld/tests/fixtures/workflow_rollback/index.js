@@ -31,6 +31,11 @@ const once = { retries: { limit: 0, delay: 0 } };
 export class Saga extends WorkflowEntrypoint {
   async run(event, step) {
     const log = this.env.LOG.getByName(event.instanceId);
+    // Block until the test allows this instance, so a check can run while
+    // the work is provably in progress.
+    const held = async () => {
+      while (!(await log.allowed())) await wait(50);
+    };
     const forward = (label, value) => async () => {
       await log.add({ step: "fwd:" + label });
       return value;
@@ -48,6 +53,7 @@ export class Saga extends WorkflowEntrypoint {
         }
         if (options.failFirst && seen === 1) throw new Error("transient " + label);
         if (options.slow) await wait(options.slow);
+        if (options.hold) await held();
       },
       ...(options.config ? { rollbackConfig: options.config } : {}),
     });
@@ -99,9 +105,17 @@ export class Saga extends WorkflowEntrypoint {
         return "unreachable";
       case "in-flight":
         await step.do("a", forward("a", "out-a"), undo("a"));
-        await step.do("slow", { retries: { limit: 0, delay: 0 }, timeout: "20 seconds" },
-          async () => { await wait(2000); return "out-slow"; }, undo("slow"));
+        await step.do("slow", { retries: { limit: 0, delay: 0 }, timeout: "30 seconds" },
+          async () => {
+            await log.add({ step: "fwd:slow" });
+            await held();
+            return "out-slow";
+          }, undo("slow"));
         return "unreachable";
+      case "held-undo":
+        await step.do("a", forward("a", "out-a"), undo("a"));
+        await step.do("b", forward("b", "out-b"), undo("b", { hold: true }));
+        throw new NonRetryableError("held-undo");
       case "sibling":
         await Promise.all([
           step.do("reserve", async () => { await wait(1500); return "out-reserve"; }, undo("reserve")),
@@ -124,6 +138,17 @@ export class Saga extends WorkflowEntrypoint {
       case "restart-from":
         await step.do("a", forward("a", "out-a"), undo("a"));
         await step.do("b", once, async () => { throw new NonRetryableError("b"); });
+        return "unreachable";
+      case "backoff":
+        // Fails until allowed, with a backoff long enough to hibernate in.
+        await step.do("a", forward("a", "out-a"), undo("a", {
+          failUntilAllowed: true,
+          config: { retries: { limit: 5, delay: "6 seconds", backoff: "constant" } },
+        }));
+        throw new NonRetryableError("backoff");
+      case "slow-sleeper":
+        await step.do("a", forward("a", "out-a"), undo("a", { slow: 3000 }));
+        await step.sleep("forever", "1 hour");
         return "unreachable";
       case "drift": {
         const options = DRIFT === "none"
@@ -159,6 +184,10 @@ export default {
           await env.WF.create({ id, params });
           return Response.json({ ok: true });
         }
+        case "/whoami":
+          // The test's per-node token (.dev.vars), so a probe can tell its
+          // own node from another test's node on a reused port.
+          return new Response(env.NODE_TOKEN ?? "");
         case "/status":
           return Response.json(await (await instance()).status());
         case "/log":
