@@ -23,6 +23,9 @@ export class Log extends DurableObject {
 }
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// The code-drift test rewrites this line between node restarts: "handler"
+// registers the rollback, "none" drops it, "config" changes its config.
+const DRIFT = "handler";
 const once = { retries: { limit: 0, delay: 0 } };
 
 export class Saga extends WorkflowEntrypoint {
@@ -122,6 +125,14 @@ export class Saga extends WorkflowEntrypoint {
         await step.do("a", forward("a", "out-a"), undo("a"));
         await step.do("b", once, async () => { throw new NonRetryableError("b"); });
         return "unreachable";
+      case "drift": {
+        const options = DRIFT === "none"
+          ? []
+          : [undo("a", DRIFT === "config" ? { config: { timeout: "5 seconds" } } : {})];
+        await step.do("a", forward("a", "out-a"), ...options);
+        await step.sleep("forever", "1 hour");
+        return "unreachable";
+      }
       case "bad-options":
         await step.do("a", async () => 1, { rollback: 5 });
         return "unreachable";

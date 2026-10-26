@@ -13,6 +13,15 @@
 //! A crash test arms one checkpoint, lets the node abort there, starts a new
 //! node on the same local state, and asserts that the rollback still settles
 //! with every handler run at least once and in order.
+//!
+//! The fleet test is ignored by default because it needs Docker. It runs a
+//! MinIO bucket and two `celld` nodes, kills the node that owns the Workflow
+//! cell in the middle of a rollback handler, and asserts that the other node
+//! takes the cell over and finishes the rollback:
+//!
+//! ```sh
+//! cargo test -p celld --test workflow_rollback -- --ignored fleet
+//! ```
 
 // The test builds a throwaway project directory and reads the failpoint
 // file; neither is node storage, which the disallowed fs methods guard.
@@ -47,10 +56,7 @@ impl Node {
         }
         let failpoints = dir.path().join("failpoints");
         std::fs::write(&failpoints, "").expect("create the failpoint file");
-        let port = TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .expect("pick a free port")
-            .port();
+        let port = free_port();
         let mut node = Self {
             _dir: dir,
             project,
@@ -72,7 +78,7 @@ impl Node {
         command
             .arg("dev")
             .arg(&self.project)
-            .args(["--port", &self.port.to_string(), "--no-watch"])
+            .args(["--port", &self.port.to_string(), "--no-watch", "--logs"])
             .env("CELLD_TEST_WORKFLOW_FAILPOINTS", &self.failpoints)
             .stdin(Stdio::null())
             .stdout(log.try_clone().expect("clone the node log"))
@@ -128,25 +134,80 @@ impl Node {
         self.spawn(false);
     }
 
-    fn try_get(&self, path: &str) -> Option<String> {
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(60))).ok()?;
-        write!(
-            stream,
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        )
-        .ok()?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).ok()?;
-        let response = String::from_utf8(response).ok()?;
-        let (head, body) = response.split_once("\r\n\r\n")?;
-        if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
-            Some(dechunk(body))
-        } else {
-            Some(body.to_owned())
-        }
+    /// Restart on the same local state, as a deploy of new code would.
+    fn restart(&mut self) {
+        self.kill();
+        self.spawn(false);
     }
 
+    /// Rewrite the fixture's `DRIFT` mode for the next start.
+    fn set_drift(&self, mode: &str) {
+        let path = self.project.join("index.js");
+        let source = std::fs::read_to_string(&path).expect("read the fixture");
+        let line = source
+            .lines()
+            .find(|line| line.starts_with("const DRIFT = "))
+            .expect("the fixture declares DRIFT")
+            .to_owned();
+        let source = source.replace(&line, &format!("const DRIFT = {mode:?};"));
+        std::fs::write(&path, source).expect("write the fixture");
+    }
+
+    /// The rollback lifecycle events the node logged for one instance, as
+    /// `kind` or `kind:step`.
+    fn events(&self, id: &str) -> Vec<String> {
+        let log = std::fs::read_to_string(self.project.join("node.log")).expect("read the node log");
+        rollback_events(&log, id)
+    }
+
+    fn try_get(&self, path: &str) -> Option<String> {
+        http_get(self.port, path)
+    }
+}
+
+fn rollback_events(log: &str, id: &str) -> Vec<String> {
+    let field = |line: &str, name: &str| {
+        line.split_once(&format!(" {name}="))
+            .map(|(_, rest)| rest.split(' ').next().unwrap_or_default().to_owned())
+            .unwrap_or_default()
+    };
+    log.lines()
+        .filter(|line| line.contains("event=\"workflow_rollback\""))
+        .filter(|line| field(line, "instance") == id)
+        .map(|line| match field(line, "step") {
+            step if step.is_empty() => field(line, "kind"),
+            step => format!("{}:{step}", field(line, "kind")),
+        })
+        .collect()
+}
+
+fn http_get(port: u16, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    let response = String::from_utf8(response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        Some(dechunk(body))
+    } else {
+        Some(body.to_owned())
+    }
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("pick a free port")
+        .port()
+}
+
+impl Node {
     fn get(&self, path: &str) -> Value {
         let body = self
             .try_get(path)
@@ -280,6 +341,21 @@ fn rollback_behaviour() {
     assert_eq!(first["output"], "out-b");
     assert_eq!(first["error"], "NonRetryableError:boom");
     assert_eq!(first["ctx"], serde_json::json!(["b", 1, 1]));
+    assert_eq!(
+        node.events("chain"),
+        [
+            "started",
+            "step_started:b",
+            "attempt_started:b",
+            "attempt_completed:b",
+            "step_completed:b",
+            "step_started:a",
+            "attempt_started:a",
+            "attempt_completed:a",
+            "step_completed:a",
+            "completed",
+        ]
+    );
 
     node.settled("repeat");
     let undone = node.undone("repeat");
@@ -317,6 +393,23 @@ fn rollback_behaviour() {
     assert_eq!(node.call("/retry-rollback", "halt"), serde_json::json!({ "ok": true }));
     assert_eq!(node.settled("halt")["rollback"], rollback("complete"));
     assert_eq!(steps(&node.undone("halt")), ["b", "b", "b", "a"]);
+    let events = node.events("halt");
+    let halted = [
+        "attempt_started:b",
+        "attempt_errored:b",
+        "attempt_started:b",
+        "attempt_errored:b",
+        "step_errored:b",
+        "errored",
+        "retried:b",
+        "started",
+        "step_started:b",
+    ];
+    assert!(
+        events.windows(halted.len()).any(|window| window == halted),
+        "{events:?}"
+    );
+    assert_eq!(events.last().map(String::as_str), Some("completed"));
 
     // run() rejecting beside a running sibling waits for it, so the
     // compensator sees its real output.
@@ -412,6 +505,52 @@ fn rollback_behaviour() {
         .as_str()
         .unwrap()
         .contains("instance does not exist"));
+}
+
+#[test]
+fn code_drift_fails_closed() {
+    let mut node = Node::start();
+    for id in ["drift-missing", "drift-config"] {
+        node.create(id, serde_json::json!({ "scenario": "drift" }));
+        node.wait_for_status(id, "waiting");
+    }
+    let terminate = "/terminate?options=%7B%22rollback%22%3Atrue%7D";
+
+    // A deploy that drops the handler fails the rollback instead of
+    // skipping the step.
+    node.set_drift("none");
+    node.restart();
+    node.call(terminate, "drift-missing");
+    let status = node.settled("drift-missing");
+    assert_eq!(status["rollback"]["outcome"], "failed");
+    assert!(status["rollback"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("did not register its handler"));
+    assert!(node.undone("drift-missing").is_empty());
+
+    // A changed rollbackConfig fails closed too, until retryRollback()
+    // accepts the deployed config.
+    node.set_drift("config");
+    node.restart();
+    node.call(terminate, "drift-config");
+    let status = node.settled("drift-config");
+    assert_eq!(status["rollback"]["outcome"], "failed");
+    assert!(status["rollback"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("rollbackConfig of step \"a\" changed"));
+    assert!(node.undone("drift-config").is_empty());
+    node.call("/retry-rollback", "drift-config");
+    assert_eq!(node.settled("drift-config")["rollback"], rollback("complete"));
+    assert_eq!(steps(&node.undone("drift-config")), ["a"]);
+
+    // Restoring the handler lets retryRollback() finish the other one.
+    node.set_drift("handler");
+    node.restart();
+    node.call("/retry-rollback", "drift-missing");
+    assert_eq!(node.settled("drift-missing")["rollback"], rollback("complete"));
+    assert_eq!(steps(&node.undone("drift-missing")), ["a"]);
 }
 
 /// Crash at one checkpoint of the "chain" scenario (a, b with handlers, then
@@ -538,4 +677,207 @@ fn storage_fault_before_a_handler_does_not_spend_its_retries() {
     assert_eq!(status["rollback"], rollback("complete"));
     assert_eq!(steps(&node.undone("chain")), ["b", "a"]);
     assert!(std::fs::read_to_string(&node.failpoints).unwrap().trim().is_empty());
+}
+
+/// MinIO, pinned by digest, as the fleet bucket. Docker Hub no longer
+/// serves the upstream image; Chainguard publishes this build.
+const MINIO_IMAGE: &str = "cgr.dev/chainguard/minio@sha256:268d68a2a3b6fc65f905a61f84d7eab6345ce6bff14f551e2b028ec31e6a1341";
+const BUCKET_USER: &str = "celld";
+const BUCKET_SECRET: &str = "celld-secret";
+
+/// A two-node fleet on a MinIO bucket. Each node keeps its own local state,
+/// so killing one is a machine failure: its cells move to the other node
+/// once its lease expires.
+struct Fleet {
+    _dir: tempfile::TempDir,
+    container: String,
+    endpoint: String,
+    nodes: Vec<FleetNode>,
+}
+
+struct FleetNode {
+    port: u16,
+    internal: u16,
+    child: Option<Child>,
+}
+
+impl Fleet {
+    fn start() -> Self {
+        let dir = tempfile::tempdir().expect("create the fleet directory");
+        let s3 = free_port();
+        let container = format!("celld-rollback-{s3}");
+        let started = Command::new("docker")
+            .args(["run", "-d", "--rm", "--name", &container, "-p"])
+            .arg(format!("127.0.0.1:{s3}:9000"))
+            .args(["-e", &format!("MINIO_ROOT_USER={BUCKET_USER}")])
+            .args(["-e", &format!("MINIO_ROOT_PASSWORD={BUCKET_SECRET}")])
+            .args([MINIO_IMAGE, "server", "/data"])
+            .stdout(Stdio::null())
+            .status()
+            .expect("run docker");
+        assert!(started.success(), "could not start MinIO in Docker");
+        let mut fleet = Self {
+            _dir: dir,
+            container,
+            endpoint: format!("http://127.0.0.1:{s3}"),
+            nodes: Vec::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while http_get(s3, "/minio/health/live").is_none() {
+            assert!(Instant::now() < deadline, "MinIO did not start");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let created = Command::new("curl")
+            .args(["-sf", "-X", "PUT", "--aws-sigv4", "aws:amz:us-east-1:s3", "--user"])
+            .arg(format!("{BUCKET_USER}:{BUCKET_SECRET}"))
+            .arg(format!("{}/celld-test", fleet.endpoint))
+            .status()
+            .expect("run curl");
+        assert!(created.success(), "could not create the bucket");
+
+        let project = fleet._dir.path().join("project");
+        std::fs::create_dir(&project).expect("create the project directory");
+        for file in ["wrangler.jsonc", "index.js"] {
+            std::fs::copy(Path::new(FIXTURE).join(file), project.join(file))
+                .expect("copy the fixture");
+        }
+        let deployed = fleet
+            .celld(&["deploy", project.to_str().expect("a UTF-8 project path")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run celld deploy");
+        assert!(deployed.success(), "celld deploy failed");
+
+        for name in ["a", "b"] {
+            let port = free_port();
+            let internal = free_port();
+            let child = fleet
+                .celld(&[])
+                .args(["--listen", &format!("127.0.0.1:{port}")])
+                .args(["--internal-listen", &format!("127.0.0.1:{internal}")])
+                .args(["--advertise", &format!("127.0.0.1:{internal}")])
+                .env("CELLD_WATCH", fleet._dir.path().join(name))
+                .env("CELLD_NODE", format!("node-{name}"))
+                .env("CELLD_READY_FLEET_GATE_MS", "0")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start a fleet node");
+            fleet.nodes.push(FleetNode {
+                port,
+                internal,
+                child: Some(child),
+            });
+        }
+        for node in &fleet.nodes {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while http_get(node.port, "/ready").as_deref() != Some("not found") {
+                assert!(Instant::now() < deadline, "a fleet node did not start");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        fleet
+    }
+
+    /// `celld [LEADING...] --bucket ... --endpoint ...`; a subcommand and its
+    /// operands must come first.
+    fn celld(&self, leading: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_celld"));
+        command
+            .args(leading)
+            .args(["--bucket", "s3://celld-test", "--endpoint", &self.endpoint])
+            .env("AWS_ACCESS_KEY_ID", BUCKET_USER)
+            .env("AWS_SECRET_ACCESS_KEY", BUCKET_SECRET)
+            .env("AWS_REGION", "us-east-1")
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn get(&self, node: usize, path: &str) -> Value {
+        let body = http_get(self.nodes[node].port, path)
+            .unwrap_or_else(|| panic!("GET {path} failed"));
+        serde_json::from_str(&body).unwrap_or_else(|_| panic!("GET {path} answered {body}"))
+    }
+
+    /// The node whose `/state` lists the Workflow cell among its cells.
+    fn workflow_owner(&self) -> Option<usize> {
+        self.nodes.iter().position(|node| {
+            http_get(node.internal, "/state")
+                .and_then(|state| serde_json::from_str::<Value>(&state).ok())
+                .and_then(|state| state["deployment"]["cells"].as_object().cloned())
+                .is_some_and(|cells| cells.keys().any(|cell| cell.starts_with("__Workflow.")))
+        })
+    }
+
+    fn kill(&mut self, node: usize) {
+        if let Some(mut child) = self.nodes[node].child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for Fleet {
+    fn drop(&mut self) {
+        for node in 0..self.nodes.len() {
+            self.kill(node);
+        }
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.container])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[test]
+#[ignore = "needs Docker; run with --ignored"]
+fn fleet_failover_finishes_the_rollback() {
+    let mut fleet = Fleet::start();
+    let params = percent_encoding::utf8_percent_encode(
+        r#"{"scenario":"slow-undo"}"#,
+        percent_encoding::NON_ALPHANUMERIC,
+    )
+    .to_string();
+    assert_eq!(
+        fleet.get(0, &format!("/create?id=failover&params={params}")),
+        serde_json::json!({ "ok": true })
+    );
+
+    // Kill the owner while the slow handler of step b runs.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fleet.get(0, "/log?id=failover").to_string().contains(r#""step":"b""#) {
+        assert!(Instant::now() < deadline, "the rollback never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let owner = fleet.workflow_owner().expect("one node owns the Workflow cell");
+    fleet.kill(owner);
+    let survivor = 1 - owner;
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        let body = http_get(fleet.nodes[survivor].port, "/status?id=failover");
+        if let Some(status) = body.and_then(|body| serde_json::from_str::<Value>(&body).ok()) {
+            if status["rollback"].is_object() {
+                break status;
+            }
+        }
+        assert!(Instant::now() < deadline, "the survivor never finished the rollback");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(status["status"], "errored");
+    assert_eq!(status["rollback"], rollback("complete"));
+    assert_eq!(fleet.workflow_owner(), Some(survivor));
+    // The interrupted handler runs again on the survivor, then the chain
+    // continues: at least once, in order.
+    let log = fleet.get(survivor, "/log?id=failover");
+    let undone: Vec<&str> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["step"].as_str())
+        .filter(|step| !step.starts_with("fwd:"))
+        .collect();
+    assert_eq!(undone, ["b", "b", "a"]);
 }

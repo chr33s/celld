@@ -117,7 +117,12 @@ resident-cell cap bound it.
 - Rollback orders steps by their first attempt's start. Cloudflare orders a
   retried step by its latest attempt, so the two can differ when a retried
   step started after a sibling.
-- Rollback lifecycle events are not emitted to analytics.
+- Rollback lifecycle events go to the node log as `event="workflow_rollback"`
+  records, not to Workflows analytics. Each names its `kind` (`started`,
+  `step_started`, `attempt_started`, `attempt_completed`, `attempt_errored`,
+  `step_completed`, `step_errored`, `completed`, `errored`, or `retried`),
+  the instance, the step, the attempt, and the error name. A record never
+  holds a step output or an error message. A crash can repeat a record.
 - `restart({ from })` runs again any earlier step whose rollback completed,
   instead of replaying its stored result.
 - A `workflows` entry cannot carry `schedules`, `limits`, or a `script_name`

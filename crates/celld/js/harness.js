@@ -9320,6 +9320,8 @@ const __WorkflowCell = (() => {
   // step starts a fresh retry budget.
   async __wfRetryRollback() {
     const storage = this._state.storage;
+    let halted;
+    let instance;
     const awaiting = transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
       if (meta === undefined) return undefined;
@@ -9329,7 +9331,10 @@ const __WorkflowCell = (() => {
       }
       const prefix = __wfLedgerPrefix(meta.generation);
       for (const [key, progress] of transaction.kv.list({ prefix: prefix + "rollback." })) {
-        if (progress.status !== "completed") transaction.kv.delete(key);
+        if (progress.status !== "completed") {
+          halted = __wfStepIdentity(prefix + "step." + key.slice((prefix + "rollback.").length), prefix);
+          transaction.kv.delete(key);
+        }
       }
       const rollback = { ...meta.rollback };
       delete rollback.outcome;
@@ -9343,9 +9348,17 @@ const __WorkflowCell = (() => {
       delete meta.expiresMs;
       transaction.kv.put("__wf.meta", meta);
       transaction.setAlarm(Date.now());
+      instance = meta;
       return meta.generation;
     });
     if (awaiting === undefined) throw __wfError("instance does not exist");
+    __wf_rollback_event(
+      "retried",
+      instance.workflowName,
+      instance.instanceId,
+      halted?.name,
+      halted?.count,
+    );
     await this._wfAwaitRollback(awaiting);
   }
   async __wfSendEvent(options) {
@@ -9686,7 +9699,7 @@ const __WorkflowCell = (() => {
     // The rollback settles into the status the instance would have had, with
     // its outcome beside it, and only then starts its retention clock.
     const finish = (failure, entry, progress) => {
-      advance((current, transaction) => {
+      const settled = advance((current, transaction) => {
         if (entry !== undefined) transaction.kv.put(entry.rollbackKey, progress);
         const rollback = { ...current.rollback };
         delete rollback.refreshFingerprints;
@@ -9705,12 +9718,30 @@ const __WorkflowCell = (() => {
         __wfFinishRetention(current, transaction);
         /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
       });
+      if (!settled) return;
+      if (entry !== undefined) emit("step_errored", entry, progress.attempt, failure);
+      emit(failure === undefined ? "completed" : "errored", undefined, undefined, failure);
     };
+    // Lifecycle events follow the commit they describe (upstream's
+    // rollback_* analytics events, here in the node log).
+    const emit = (kind, entry, attempt, error) =>
+      __wf_rollback_event(
+        kind,
+        meta.workflowName,
+        meta.instanceId,
+        entry?.name,
+        entry?.count,
+        attempt,
+        error === undefined ? undefined : String(error?.name ?? "Error"),
+      );
     let plan;
+    let started = false;
     if (!advance((current, transaction) => {
+      started = current.rollback.phase === "requested";
       current.rollback.phase = "compensating";
       plan = __wfRollbackPlan(transaction, current.generation);
     })) return;
+    if (started) emit("started");
     const pending = plan.filter((entry) => entry.progress?.status !== "completed");
     if (pending.length === 0) {
       finish(undefined);
@@ -9807,6 +9838,8 @@ const __WorkflowCell = (() => {
       // forever. A failed proof throws, and the alarm retries the drive.
       await storage.sync();
       /*__CELLD_TEST_WORKFLOW_FAILPOINT:rollback.before_handler__*/
+      if (prior === 0) emit("step_started", entry);
+      emit("attempt_started", entry, attempt);
       let failed = false;
       let error;
       try {
@@ -9834,6 +9867,8 @@ const __WorkflowCell = (() => {
         if (!advance((_current, transaction) => {
           transaction.kv.put(entry.rollbackKey, { status: "completed", attempt });
         })) return;
+        emit("attempt_completed", entry, attempt);
+        emit("step_completed", entry, attempt);
         /*__CELLD_TEST_WORKFLOW_FAILPOINT:rollback.after_step__*/
         continue;
       }
@@ -9851,6 +9886,7 @@ const __WorkflowCell = (() => {
       // A terminal failure halts the chain: the earlier steps keep their
       // effects and the instance reports the failure for reconciliation.
       if (nextAt === undefined) {
+        emit("attempt_errored", entry, attempt, error);
         finish(error, entry, {
           status: "failed",
           attempt,
@@ -9858,7 +9894,7 @@ const __WorkflowCell = (() => {
         });
         return;
       }
-      advance((_current, transaction) => {
+      if (advance((_current, transaction) => {
         transaction.kv.put(entry.rollbackKey, {
           status: "retrying",
           attempt,
@@ -9866,7 +9902,7 @@ const __WorkflowCell = (() => {
           error: __wfErrorRecord(error),
         });
         transaction.setAlarm(nextAt);
-      });
+      })) emit("attempt_errored", entry, attempt, error);
       return;
     }
     /*__CELLD_TEST_WORKFLOW_FAILPOINT:rollback.before_finish__*/

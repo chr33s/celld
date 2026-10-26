@@ -6772,6 +6772,7 @@ ops! { OP_NAMES, install_op_functions,
         "__d1_run" => storage_ops::op_d1_run,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
+        "__wf_rollback_event" => op_wf_rollback_event,
         "__storage_put" => storage_ops::op_storage_put,
         "__storage_put_many" => storage_ops::op_storage_put_many,
         "__storage_queue_put" => storage_ops::op_storage_queue_put,
@@ -10027,6 +10028,44 @@ fn op_process_exit(
         context_id: context.continuation_id(),
     });
     scope.terminate_execution();
+}
+
+/// One Workflow rollback lifecycle event, the node-log counterpart of what
+/// upstream emits to Workflows analytics. The harness calls it after the
+/// transition commits, so a crash can repeat an event but never report one
+/// that did not happen. It records the step and the error's name, never a
+/// step output or an error message: either can carry application data.
+fn op_wf_rollback_event(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let text = |index: i32| {
+        let value = args.get(index);
+        if value.is_undefined() {
+            String::new()
+        } else {
+            value.to_rust_string_lossy(scope)
+        }
+    };
+    let kind = text(0);
+    let workflow = text(1);
+    let instance = text(2);
+    let step = text(3);
+    let count = text(4);
+    let attempt = text(5);
+    let error = text(6);
+    tracing::info!(
+        event = "workflow_rollback",
+        kind = %kind,
+        workflow = %workflow,
+        instance = %instance,
+        step = %step,
+        count = %count,
+        attempt = %attempt,
+        error = %error,
+        "workflow rollback {kind}"
+    );
 }
 
 fn op_log(
