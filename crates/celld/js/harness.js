@@ -7941,9 +7941,17 @@ const __wfError = (message) => new Error("WORKFLOW_ERROR: " + message);
 // settles in this invocation, so user code simply stops progressing. A
 // sentinel thrown through user code was rejected because `Promise.all` in
 // `run()` would observe it as a rejection and user try/catch would eat it.
-const __wfNever = new Promise(() => {});
+// Each call gets its own promise; a shared one would keep every parked
+// frame, and all it holds, reachable for the life of the isolate.
+const __wfNever = () => new Promise(() => {});
 const __wfTerminal = (status) =>
   status === "complete" || status === "errored" || status === "terminated";
+// A rollback in progress keeps the public status "running" (upstream's
+// Workers API contract), so the phase in `meta.rollback` is what fences
+// forward work and the RPCs that would otherwise accept a running instance.
+const __wfRollingBack = (meta) =>
+  meta.rollback !== undefined && !__wfTerminal(meta.status) &&
+  (meta.rollback.phase === "requested" || meta.rollback.phase === "compensating");
 // Upstream's hard bounds: 10,000 retries per step, 365 days for any sleep or
 // event wait, one second under a waitForEvent timeout. Enforced loudly at the
 // call site -- a config outside them would otherwise misbehave only after
@@ -7968,6 +7976,10 @@ const __WF_LOCATION_HINTS = new Set([
 // sane un-stepped await and short enough that a truly never-settling
 // promise fails the instance instead of wedging the alarm handler.
 const __WF_STALL_GRACE_MS = 60000;
+// How long terminate({rollback: true}) and retryRollback() wait for the
+// rollback to settle before resolving with it still running. It stays below
+// the node drain deadline so a waiting caller cannot hold a drain open.
+const __WF_ROLLBACK_WAIT_MS = 10000;
 const __WF_UNITS = {
   second: 1000,
   minute: 60000,
@@ -8231,6 +8243,104 @@ const __wfStepConfig = (config, name) => {
     ...(retries === undefined ? {} : { retries: { ...retries } }),
   };
 };
+// The rollback argument of step.do. Its config takes the forward step's
+// retries/timeout validators but not `sensitive`, which upstream's
+// WorkflowStepRollbackConfig omits.
+const __wfRollbackOptions = (options, name) => {
+  if (options === undefined) return undefined;
+  const what = `rollback options for step ${JSON.stringify(name)}`;
+  if (!__wfOwnObject(options)) {
+    throw __wfError(`invalid ${what}: use an object with a rollback function`);
+  }
+  const unknown = __wfUnknownKey(options, ["rollback", "rollbackConfig"]);
+  if (unknown !== undefined) {
+    throw __wfError(`invalid ${what}: unknown option ${JSON.stringify(unknown)}`);
+  }
+  if (typeof options.rollback !== "function") {
+    throw __wfError(`invalid ${what}: rollback must be a function`);
+  }
+  let config = {};
+  if (options.rollbackConfig !== undefined) {
+    if (__wfOwnObject(options.rollbackConfig) &&
+        options.rollbackConfig.sensitive !== undefined) {
+      throw __wfError(`invalid ${what}: rollbackConfig has an unknown option "sensitive"`);
+    }
+    try {
+      config = __wfStepConfig(options.rollbackConfig, name);
+    } catch (error) {
+      throw __wfError(
+        `invalid ${what}: rollbackConfig: ` +
+          String(error.message).replace(/^WORKFLOW_ERROR: /, ""),
+      );
+    }
+  }
+  // Persisted with the step so a deploy that changes the policy under an
+  // unfinished rollback is detected. A delay function has no stable form;
+  // only its presence is recorded.
+  const retries = config.retries;
+  const fingerprint = JSON.stringify({
+    retries: retries === undefined ? null : {
+      ...retries,
+      delay: typeof retries.delay === "function" ? "function" : retries.delay,
+    },
+    timeout: config.timeout ?? null,
+  });
+  return { handler: options.rollback, config, fingerprint };
+};
+// Lenient like the call it replaces: terminate(null) and unrelated option
+// fields keep working, and only `rollback: true` asks for compensation.
+const __wfTerminateOptions = (options) =>
+  options !== null && typeof options === "object" && options.rollback === true
+    ? { rollback: true }
+    : {};
+// The retry deadline shared by forward and rollback attempts. Upstream
+// documents the backoff names, not the arithmetic; the simplest reading is
+// used and recorded in the design page. When `retries` is given without
+// `backoff`, celld uses constant -- the documented exponential default is
+// the whole-config-omitted case.
+const __wfRetryAt = async (retries, attempt, name, delayArgs) => {
+  const dynamic = typeof retries.delay === "function";
+  const delay = dynamic
+    ? await __wfEnterStep(name, () => retries.delay(delayArgs))
+    : retries.delay;
+  const base = __wfDuration(
+    delay,
+    `the retry delay of step ${JSON.stringify(name)}`,
+  );
+  // A delay callback replaces the fixed base duration, not the backoff
+  // policy. Skipping this factor makes a dynamic exponential or linear
+  // policy retry earlier than the same policy with a fixed base.
+  const factor = retries.backoff === "exponential"
+    ? 2 ** (attempt - 1)
+    : retries.backoff === "linear"
+    ? attempt
+    : 1;
+  return Date.now() + base * factor;
+};
+// A fresh object per call: the step context hands it to user code, which
+// could otherwise rewrite the default policy for the whole isolate.
+const __wfDefaultRetries = () => ({ limit: 5, delay: 10000, backoff: "exponential" });
+const __WF_DEFAULT_TIMEOUT = "10 minutes";
+// Upstream omits a dynamic delay from the step context. Copying the config
+// verbatim would expose the callback to itself as retry policy, while
+// callers expect only the serializable limit and backoff fields.
+const __wfStepContext = (name, count, attempt, retries, timeout) => ({
+  step: { name, count },
+  attempt,
+  config: {
+    retries: typeof retries.delay === "function"
+      ? { limit: retries.limit, ...(retries.backoff === undefined
+        ? {}
+        : { backoff: retries.backoff }) }
+      : retries,
+    timeout,
+  },
+});
+const __wfPermanentFailure = (error, attempt, retries) =>
+  error instanceof NonRetryableError ||
+  (error !== null && typeof error === "object" &&
+    (error.name === "NonRetryableError" || error.__wfPermanent === true)) ||
+  attempt > retries.limit;
 // Serialization is checked with the same encoder storage and RPC use, so a
 // value that passes here cannot fail later at the isolate boundary. The
 // thrown errors are permanent: retrying cannot make a value cloneable or
@@ -8272,6 +8382,15 @@ const __wfReviveError = (record) => {
   return error;
 };
 const __wfLedgerPrefix = (generation) => `__wf.${generation}.`;
+// The ledger key is `<prefix>step.<per-name-count>.<name>`. Identity is
+// derived from it because a record stores replay state, not identity.
+const __wfStepIdentity = (key, prefix) => {
+  const suffix = key.slice((prefix + "step.").length);
+  const dot = suffix.indexOf(".");
+  return dot < 0
+    ? { name: "", count: Number(suffix) }
+    : { name: suffix.slice(dot + 1), count: Number(suffix.slice(0, dot)) };
+};
 const __wfEventPrefix = (generation) =>
   __wfLedgerPrefix(generation) + "event.";
 const __wfEventKey = (generation, sequence) =>
@@ -8382,7 +8501,7 @@ const __wfMakeStep = (driver) => {
     // A stale replay -- one whose invocation already suspended -- can wake
     // later if user code raced a step against an un-stepped await. It goes
     // quiet instead of executing an attempt beside the fresh replay.
-    if (driver.finished) return __wfNever;
+    if (driver.finished) return __wfNever();
     const enclosing = __wfEnclosingStep();
     if (enclosing !== undefined) {
       const failure = __wfError(
@@ -8404,10 +8523,16 @@ const __wfMakeStep = (driver) => {
     return new Promise((resolve, reject) => {
       (async () => {
         const meta = await storage.get("__wf.meta");
-        if (
-          meta === undefined || meta.generation !== driver.generation ||
+        if (meta === undefined || meta.generation !== driver.generation) {
+          return { pause: true };
+        }
+        // A rehydration replay runs only while its rollback does; a forward
+        // replay stops at the first step once a rollback owns the instance.
+        if (driver.rehydrate !== undefined) {
+          if (!__wfRollingBack(meta)) return { pause: true };
+        } else if (
           __wfTerminal(meta.status) || meta.status === "paused" ||
-          meta.status === "waitingForPause"
+          meta.status === "waitingForPause" || __wfRollingBack(meta)
         ) {
           return { pause: true };
         }
@@ -8415,6 +8540,7 @@ const __wfMakeStep = (driver) => {
       })().then(
         (result) => {
           driver.running -= 1;
+          driver.notifyIdle();
           driver.clearStall();
           if (result.pause === true) {
             driver.pauseRequested = true;
@@ -8433,6 +8559,7 @@ const __wfMakeStep = (driver) => {
         },
         (error) => {
           driver.running -= 1;
+          driver.notifyIdle();
           driver.clearStall();
           driver.check();
           reject(error);
@@ -8440,21 +8567,28 @@ const __wfMakeStep = (driver) => {
       );
     });
   };
+  // A write after the callback's await re-checks the instance in the same
+  // commit. A rollback or restart that landed while the callback ran owns
+  // the ledger now, so the late result is dropped instead of racing
+  // compensation over the same record.
+  const fencedPut = (key, record) => storage.transactionSync(() => {
+    const meta = storage.kv.get("__wf.meta");
+    if (meta === undefined || meta.generation !== driver.generation ||
+        meta.rollback !== undefined) return false;
+    storage.kv.put(key, record);
+    return true;
+  });
   const doStep = (name, configOrCallback, callbackOrRollback, maybeRollback) => {
     const hasConfig = typeof configOrCallback !== "function";
     let config = hasConfig ? (configOrCallback ?? {}) : {};
     const callback = hasConfig ? callbackOrRollback : configOrCallback;
-    const rollback = hasConfig ? maybeRollback : callbackOrRollback;
+    let rollback = hasConfig ? maybeRollback : callbackOrRollback;
     try {
       __wfStepName(name);
       config = __wfStepConfig(config, name);
+      rollback = __wfRollbackOptions(rollback, name);
     } catch (error) {
       return Promise.reject(error);
-    }
-    if (rollback !== undefined) {
-      return Promise.reject(__wfError(
-        "step rollbackOptions are not implemented in celld; remove the rollback handler",
-      ));
     }
     if (config.sensitive !== undefined) {
       return Promise.reject(__wfError(
@@ -8464,8 +8598,48 @@ const __wfMakeStep = (driver) => {
     if (typeof callback !== "function") {
       return Promise.reject(__wfError("step.do needs a callback function"));
     }
+    const retries = config.retries ?? __wfDefaultRetries();
+    const timeout = config.timeout ?? __WF_DEFAULT_TIMEOUT;
+    // A step with a rollback handler marks every record it writes, so the
+    // ledger alone names the steps a rollback must cover -- including one
+    // whose handler a later deploy no longer registers.
     return frame(name, async (key, count, ordinal) => {
       const record = __wfKindCheck(await storage.get(key), "do", name);
+      // A mark already on the record survives a deploy that drops the
+      // handler, so the rollback fails closed instead of skipping the step.
+      const marks = (attempt) =>
+        rollback !== undefined
+          ? {
+            hasRollback: true,
+            rollbackFingerprint: rollback.fingerprint,
+            lastAttempt: attempt,
+          }
+          : record?.hasRollback === true
+          ? {
+            hasRollback: true,
+            rollbackFingerprint: record.rollbackFingerprint,
+            lastAttempt: attempt,
+          }
+          : {};
+      if (driver.rehydrate !== undefined) {
+        // Rehydration never runs a forward callback. A step that never
+        // started cannot have registered a rollback, and blocking on it ends
+        // the replay; a started but unfinished step resolves undefined so
+        // its parallel or later siblings still register, as upstream.
+        if (record === undefined) return { block: 0, kind: "rehydrate" };
+        if (rollback !== undefined && record.hasRollback === true) {
+          driver.rehydrate.register(key, {
+            handler: rollback.handler,
+            config: rollback.config,
+            fingerprint: rollback.fingerprint,
+            context: __wfStepContext(name, count, record.lastAttempt ?? 1, retries, timeout),
+            output: record.status === "completed" ? record.value : undefined,
+          });
+        }
+        if (record.status === "completed") return { value: record.value };
+        if (record.status === "failed") throw __wfReviveError(record.error);
+        return { value: undefined };
+      }
       if (record !== undefined && record.status === "completed") {
         return { value: record.value };
       }
@@ -8480,36 +8654,22 @@ const __wfMakeStep = (driver) => {
       }
       const attempt = (record === undefined ? 0 : record.attempt) + 1;
       const historyOrdinal = record?.ordinal ?? ordinal;
-      const retries = config.retries ??
-        { limit: 5, delay: 10000, backoff: "exponential" };
-      const timeout = config.timeout ?? "10 minutes";
       const timeoutMs = __wfDuration(
         timeout,
         `the timeout of step ${JSON.stringify(name)}`,
       );
-      // Upstream omits a dynamic delay from the step context. Copying the
-      // config verbatim would expose the callback to itself as retry policy,
-      // while callers expect only the serializable limit and backoff fields.
-      const contextRetries = typeof retries.delay === "function"
-        ? { limit: retries.limit, ...(retries.backoff === undefined
-          ? {}
-          : { backoff: retries.backoff }) }
-        : retries;
-      const context = {
-        step: { name, count },
-        attempt,
-        config: { retries: contextRetries, timeout },
-      };
+      const context = __wfStepContext(name, count, attempt, retries, timeout);
       try {
         // Persist the history entry before the callback starts. A concurrent
-        // selected restart can therefore name an in-flight occurrence, and
-        // its new generation fences the callback's eventual old-ledger write.
-        await storage.put(key, {
+        // selected restart can therefore name an in-flight occurrence, and a
+        // rollback can cover a callback whose effect may already be done.
+        if (!fencedPut(key, {
           kind: "do",
           status: "running",
           attempt: attempt - 1,
           ordinal: historyOrdinal,
-        });
+          ...marks(attempt),
+        })) return { pause: true };
         const value = await __wfTimeout(
           __wfEnterStep(name, async () => callback(context)),
           timeoutMs,
@@ -8519,64 +8679,45 @@ const __wfMakeStep = (driver) => {
         if (value !== undefined) {
           __wfCheckValue(value, `the return value of step ${JSON.stringify(name)}`);
         }
-        await storage.put(key, {
+        if (!fencedPut(key, {
           kind: "do",
           status: "completed",
           value,
           ordinal: historyOrdinal,
-        });
+          ...marks(attempt),
+        })) return { pause: true };
         return { value };
       } catch (error) {
         // NonRetryableError skips retries by contract; a value-cap or
         // serialization failure is marked permanent above because another
         // attempt returns the same value.
-        const permanent = error instanceof NonRetryableError ||
-          (error !== null && typeof error === "object" &&
-            (error.name === "NonRetryableError" || error.__wfPermanent === true)) ||
-          attempt > retries.limit;
-        if (permanent) {
-          await storage.put(key, {
+        if (__wfPermanentFailure(error, attempt, retries)) {
+          if (!fencedPut(key, {
             kind: "do",
             status: "failed",
             error: __wfErrorRecord(error),
             ordinal: historyOrdinal,
-          });
+            ...marks(attempt),
+          })) return { pause: true };
           throw error;
         }
-        // Upstream documents the backoff names, not the arithmetic; the
-        // simplest reading is used and recorded in the design page. When
-        // `retries` is given without `backoff`, celld uses constant -- the
-        // documented exponential default is the whole-config-omitted case.
-        const dynamic = typeof retries.delay === "function";
-        const delay = dynamic
-          ? await __wfEnterStep(name, () => retries.delay({ ctx: context, error }))
-          : retries.delay;
-        const base = __wfDuration(
-          delay,
-          `the retry delay of step ${JSON.stringify(name)}`,
-        );
-        // A delay callback replaces the fixed base duration, not the backoff
-        // policy. Skipping this factor makes a dynamic exponential or linear
-        // policy retry earlier than the same policy with a fixed base.
-        const factor = retries.backoff === "exponential"
-          ? 2 ** (attempt - 1)
-          : retries.backoff === "linear"
-          ? attempt
-          : 1;
-        const nextAt = Date.now() + base * factor;
-        await storage.put(key, {
+        const nextAt = await __wfRetryAt(retries, attempt, name, { ctx: context, error });
+        if (!fencedPut(key, {
           kind: "do",
           status: "retrying",
           attempt,
           nextAt,
           ordinal: historyOrdinal,
-        });
+          ...marks(attempt),
+        })) return { pause: true };
         return { block: nextAt, kind: "retry" };
       }
     });
   };
   const sleepUntilDeadline = (name, key, ordinal, deadline) => (async () => {
     const record = __wfKindCheck(await storage.get(key), "sleep", name);
+    // Rehydration must reach the steps after a sleep without parking on it.
+    if (driver.rehydrate !== undefined) return { value: undefined };
     if (record !== undefined && record.status === "completed") {
       return { value: undefined };
     }
@@ -8665,6 +8806,9 @@ const __wfMakeStep = (driver) => {
         if (record !== undefined && record.status === "failed") {
           throw __wfReviveError(record.error);
         }
+        // Rehydration neither waits nor consumes: an unmatched wait resolves
+        // undefined, as upstream's rollback replay does.
+        if (driver.rehydrate !== undefined) return { value: undefined };
         if (record === undefined) {
           record = {
             kind: "event",
@@ -8731,6 +8875,157 @@ const __wfMakeStep = (driver) => {
       });
     },
   };
+};
+
+// One replay of run(): the step-call counters, the quiescence check that
+// suspends or finishes it, and the outcome a drive awaits. A forward drive
+// and a rollback's rehydration replay share it, so both assign the same
+// occurrence counts and ordinals to the same calls.
+const __wfNewDriver = (storage, meta) => {
+  const driver = {
+    storage: undefined,
+    storageFailure: undefined,
+    generation: meta.generation,
+    ledgerPrefix: __wfLedgerPrefix(meta.generation),
+    counts: new Map(),
+    ordinal: 0,
+    running: 0,
+    blocked: [],
+    pauseRequested: false,
+    // Set only for a rollback's rehydration replay: { register(key, entry) }.
+    rehydrate: undefined,
+    finished: false,
+    checkQueued: false,
+    stallTimer: undefined,
+    idleWaiters: [],
+    // Resolves once no step callback is executing. run() can settle while a
+    // sibling callback still runs; compensation must not start beside it.
+    idle() {
+      if (this.running === 0) return Promise.resolve();
+      return new Promise((resolve) => this.idleWaiters.push(resolve));
+    },
+    notifyIdle() {
+      if (this.running !== 0) return;
+      for (const resolve of this.idleWaiters.splice(0)) resolve();
+    },
+    clearStall() {
+      if (this.stallTimer !== undefined) {
+        clearTimeout(this.stallTimer);
+        this.stallTimer = undefined;
+      }
+    },
+  };
+  driver.storage = __wfTrackStorageFailures(storage, driver);
+  const outcome = new Promise((resolve) => {
+    driver.finish = (result) => {
+      if (driver.finished) return;
+      driver.finished = true;
+      driver.clearStall();
+      resolve(result);
+    };
+  });
+  // Quiescence: when a step is blocked, no step callback is executing,
+  // and a macrotask has passed, nothing can progress, so the invocation
+  // suspends. The macrotask lets every microtask chain a completed step
+  // unblocked drain first; checking on the spot would suspend an instance
+  // whose next step is one `await` away from starting.
+  driver.check = () => {
+    if (driver.checkQueued || driver.finished) return;
+    driver.checkQueued = true;
+    setTimeout(() => {
+      driver.checkQueued = false;
+      if (driver.finished || driver.running !== 0) return;
+      // A rehydration replay whose run() settled is done once no branch can
+      // still reach a step; a parallel branch may register after a sibling
+      // rejected run().
+      if (driver.rehydrate?.settled === true) {
+        driver.finish({ kind: "settled" });
+        return;
+      }
+      if (driver.pauseRequested) {
+        driver.finish({ kind: "pause" });
+        return;
+      }
+      if (driver.blocked.length > 0) {
+        driver.finish({ kind: "suspend" });
+        return;
+      }
+      // No step runs, none is blocked, and run() has not settled: it
+      // awaits something that is not a step. Upstream permits that -- an
+      // un-stepped `await fetch()` between steps is legal, merely
+      // non-durable -- so this is not yet an error; but a promise that
+      // never settles would wedge the alarm handler in silence, with the
+      // instance "running" forever. A grace timer splits the two: if the
+      // same nothing-can-progress state still holds when it fires, the
+      // instance fails loudly. The timer is a plain in-isolate timeout,
+      // not a durable alarm, on purpose: an eviction or a restart replays
+      // run() from the top anyway, so losing the timer loses nothing --
+      // the replay re-enters the same stall and re-arms its own grace.
+      if (driver.stallTimer !== undefined) return;
+      driver.stallTimer = setTimeout(() => {
+        driver.stallTimer = undefined;
+        if (driver.finished || driver.running !== 0 || driver.blocked.length > 0) {
+          return;
+        }
+        driver.finish({
+          kind: "error",
+          error: __wfError(
+            "run() has been awaiting something that is not a step for " +
+              (__WF_STALL_GRACE_MS / 1000) + " seconds while no step is " +
+              "running or blocked; a replay cannot resume this wait, so " +
+              "wrap long async work in step.do",
+          ),
+        });
+      }, __WF_STALL_GRACE_MS);
+    }, 0);
+  };
+  return { driver, outcome };
+};
+
+const __wfStartRun = (cls, meta, step) => {
+  const event = {
+    payload: meta.params,
+    timestamp: new Date(meta.createdMs),
+    instanceId: meta.instanceId,
+    workflowName: meta.workflowName,
+  };
+  // ExecutionContext-shaped, as the WorkflowEntrypoint constructor
+  // documents upstream.
+  const ctx = {
+    waitUntil: __registerWaitUntil,
+    passThroughOnException() {},
+  };
+  return (async () => new cls(ctx, __cell.env).run(event, step))();
+};
+const __wfRollbackKey = (stepKey, prefix) =>
+  prefix + "rollback." + stepKey.slice((prefix + "step.").length);
+const __wfHasRollbackSteps = (transaction, generation) => {
+  for (const [, record] of transaction.kv.list({
+    prefix: __wfLedgerPrefix(generation) + "step.",
+  })) {
+    if (record.kind === "do" && record.hasRollback === true) return true;
+  }
+  return false;
+};
+// The steps a rollback covers, latest start first: every `do` step that was
+// admitted with a handler, whatever its forward outcome, with the progress
+// of its compensation. The ordinal is assigned at call time and kept across
+// attempts, so parallel steps order by start, not by finish.
+const __wfRollbackPlan = (transaction, generation) => {
+  const prefix = __wfLedgerPrefix(generation);
+  const plan = [];
+  for (const [key, record] of transaction.kv.list({ prefix: prefix + "step." })) {
+    if (record.kind !== "do" || record.hasRollback !== true) continue;
+    const rollbackKey = __wfRollbackKey(key, prefix);
+    plan.push({
+      key,
+      rollbackKey,
+      ...__wfStepIdentity(key, prefix),
+      record,
+      progress: transaction.kv.get(rollbackKey),
+    });
+  }
+  return plan.sort((left, right) => right.record.ordinal - left.record.ordinal);
 };
 
 const __WorkflowCell = (() => {
@@ -8825,7 +9120,13 @@ const __WorkflowCell = (() => {
     // the only honest "no such instance" signal. Inventing an instance here
     // would turn every typo into an empty workflow.
     if (meta === undefined) throw __wfError("instance does not exist");
-    const status = { status: meta.status, rollback: null };
+    const settled = meta.rollback !== undefined && !__wfRollingBack(meta);
+    const status = {
+      status: meta.status,
+      rollback: settled
+        ? { outcome: meta.rollback.outcome, error: meta.rollback.error ?? null }
+        : null,
+    };
     if (meta.error !== undefined) status.error = meta.error;
     if (meta.output !== undefined) status.output = meta.output;
     return status;
@@ -8852,6 +9153,9 @@ const __WorkflowCell = (() => {
     transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
       if (meta === undefined) throw __wfError("instance does not exist");
+      if (__wfRollingBack(meta)) {
+        throw __wfError("cannot pause an instance that is rolling back");
+      }
       if (__wfTerminal(meta.status) || meta.status === "paused" ||
           meta.status === "waitingForPause") return;
       if (meta.status === "running") {
@@ -8871,6 +9175,9 @@ const __WorkflowCell = (() => {
     transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
       if (meta === undefined) throw __wfError("instance does not exist");
+      if (__wfRollingBack(meta)) {
+        throw __wfError("cannot resume an instance that is rolling back");
+      }
       if (meta.status === "waitingForPause") {
         meta.status = "running";
         transaction.kv.put("__wf.meta", meta);
@@ -8904,6 +9211,11 @@ const __WorkflowCell = (() => {
     transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
       if (meta === undefined) throw __wfError("instance does not exist");
+      // A new generation beside unfinished compensators would run forward
+      // work against effects the rollback is still undoing.
+      if (__wfRollingBack(meta)) {
+        throw __wfError("cannot restart an instance that is rolling back");
+      }
       const oldPrefix = __wfLedgerPrefix(meta.generation);
       let targetOrdinal;
       if (checked.from !== undefined) {
@@ -8914,13 +9226,8 @@ const __WorkflowCell = (() => {
         const history = [...transaction.kv.list({ prefix: oldPrefix + "step." })]
           .filter(([, record]) => Number.isInteger(record.ordinal))
           .sort((left, right) => left[1].ordinal - right[1].ordinal);
-        // The ledger key is `<prefix>step.<per-name-count>.<name>`. Derive
-        // the name from it because a record stores replay state, not identity.
         for (const [key, record] of history) {
-          const marker = oldPrefix + "step.";
-          const suffix = key.slice(marker.length);
-          const dot = suffix.indexOf(".");
-          const name = dot < 0 ? "" : suffix.slice(dot + 1);
+          const { name } = __wfStepIdentity(key, oldPrefix);
           if (record.kind !== expectedKind || name !== checked.from.name) continue;
           occurrence += 1;
           if (occurrence === checked.from.count) {
@@ -8939,7 +9246,13 @@ const __WorkflowCell = (() => {
       const newPrefix = __wfLedgerPrefix(generation);
       if (targetOrdinal !== undefined) {
         for (const [key, record] of transaction.kv.list({ prefix: oldPrefix + "step." })) {
-          if (Number.isInteger(record.ordinal) && record.ordinal < targetOrdinal) {
+          // A step whose effect a rollback already undid runs again rather
+          // than replaying an output that names something gone, and that a
+          // later rollback would undo a second time.
+          const undone = record.hasRollback === true &&
+            transaction.kv.get(__wfRollbackKey(key, oldPrefix))?.status === "completed";
+          if (Number.isInteger(record.ordinal) && record.ordinal < targetOrdinal &&
+              !undone) {
             transaction.kv.put(newPrefix + key.slice(oldPrefix.length), record);
           }
         }
@@ -8952,13 +9265,15 @@ const __WorkflowCell = (() => {
       delete meta.pausedMs;
       delete meta.output;
       delete meta.error;
+      delete meta.rollback;
       transaction.kv.put("__wf.meta", meta);
       transaction.setAlarm(Date.now());
     });
   }
-  async __wfTerminate() {
+  async __wfTerminate(options) {
+    const { rollback } = __wfTerminateOptions(options);
     const storage = this._state.storage;
-    transactionSync(storage, (transaction) => {
+    const awaiting = transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
       if (meta === undefined) throw __wfError("instance does not exist");
       if (__wfTerminal(meta.status)) {
@@ -8966,11 +9281,68 @@ const __WorkflowCell = (() => {
           `cannot terminate an instance with status ${JSON.stringify(meta.status)}`,
         );
       }
+      if (__wfRollingBack(meta)) {
+        throw __wfError("cannot terminate an instance that is rolling back");
+      }
+      // The request, the fence it puts on forward writes, and the wake that
+      // runs it are one commit. A paused instance compensates without
+      // resuming its forward work, as upstream.
+      if (rollback === true && __wfHasRollbackSteps(transaction, meta.generation)) {
+        meta.status = "running";
+        delete meta.pausedMs;
+        meta.rollback = {
+          trigger: "terminate",
+          originalTerminalStatus: "terminated",
+          originalError: {
+            name: "Terminated",
+            message: "Instance terminated during rollback",
+          },
+          phase: "requested",
+        };
+        transaction.kv.put("__wf.meta", meta);
+        transaction.setAlarm(Date.now());
+        return meta.generation;
+      }
       meta.status = "terminated";
       __wfFinishRetention(meta, transaction);
       transaction.kv.put("__wf.meta", meta);
       /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
+      return undefined;
     });
+    if (awaiting !== undefined) await this._wfAwaitRollback(awaiting);
+  }
+  // celld extension: resume a rollback that halted on a failed compensation,
+  // under the deployed code. Completed compensations stay done; the halted
+  // step starts a fresh retry budget.
+  async __wfRetryRollback() {
+    const storage = this._state.storage;
+    const awaiting = transactionSync(storage, (transaction) => {
+      const meta = transaction.kv.get("__wf.meta");
+      if (meta === undefined) return undefined;
+      if (expireTerminal(transaction, meta, Date.now())) return undefined;
+      if (!__wfTerminal(meta.status) || meta.rollback?.phase !== "failed") {
+        throw __wfError("retryRollback() needs an instance whose rollback failed");
+      }
+      const prefix = __wfLedgerPrefix(meta.generation);
+      for (const [key, progress] of transaction.kv.list({ prefix: prefix + "rollback." })) {
+        if (progress.status !== "completed") transaction.kv.delete(key);
+      }
+      const rollback = { ...meta.rollback };
+      delete rollback.outcome;
+      delete rollback.error;
+      rollback.phase = "requested";
+      rollback.refreshFingerprints = true;
+      meta.rollback = rollback;
+      meta.status = "running";
+      delete meta.error;
+      delete meta.endedMs;
+      delete meta.expiresMs;
+      transaction.kv.put("__wf.meta", meta);
+      transaction.setAlarm(Date.now());
+      return meta.generation;
+    });
+    if (awaiting === undefined) throw __wfError("instance does not exist");
+    await this._wfAwaitRollback(awaiting);
   }
   async __wfSendEvent(options) {
     const storage = this._state.storage;
@@ -8985,6 +9357,9 @@ const __WorkflowCell = (() => {
         throw __wfError(
           `cannot send an event to an instance with status ${JSON.stringify(meta.status)}`,
         );
+      }
+      if (__wfRollingBack(meta)) {
+        throw __wfError("cannot send an event to an instance that is rolling back");
       }
       const sequenceKey = __wfLedgerPrefix(meta.generation) + "eventSeq";
       const sequence = transaction.kv.get(sequenceKey) ?? 0;
@@ -9093,16 +9468,23 @@ const __WorkflowCell = (() => {
     // wins the race" true rather than asserted. Writing back the meta this
     // drive entered with would resurrect a terminated instance as "waiting"
     // and re-arm the alarm its terminate deleted.
+    // A rollback that landed mid-drive owns the instance the same way a
+    // terminate does: this drive's outcome is dropped, not written over it.
     const settle = (mutate) => transactionSync(storage, (transaction) => {
       const current = transaction.kv.get("__wf.meta");
       if (current === undefined || __wfTerminal(current.status) ||
-          current.generation !== meta.generation) return false;
+          current.generation !== meta.generation ||
+          current.rollback !== undefined) return false;
       mutate(current, transaction);
       transaction.kv.put("__wf.meta", current);
       return true;
     });
     const className = __cell.workflows[meta.workflowName];
     const cls = className === undefined ? undefined : __cf.exports[className];
+    if (__wfRollingBack(meta)) {
+      await this._driveRollback(meta, cls);
+      return;
+    }
     if (typeof cls !== "function" ||
         typeof (cls.prototype && cls.prototype.run) !== "function") {
       // Deploy cannot see inside the bundle, so a missing export fails
@@ -9123,83 +9505,7 @@ const __WorkflowCell = (() => {
       });
       return;
     }
-    const driver = {
-      storage: undefined,
-      storageFailure: undefined,
-      generation: meta.generation,
-      ledgerPrefix: __wfLedgerPrefix(meta.generation),
-      counts: new Map(),
-      ordinal: 0,
-      running: 0,
-      blocked: [],
-      pauseRequested: false,
-      finished: false,
-      checkQueued: false,
-      stallTimer: undefined,
-      clearStall() {
-        if (this.stallTimer !== undefined) {
-          clearTimeout(this.stallTimer);
-          this.stallTimer = undefined;
-        }
-      },
-    };
-    driver.storage = __wfTrackStorageFailures(storage, driver);
-    const outcome = new Promise((resolve) => {
-      driver.finish = (result) => {
-        if (driver.finished) return;
-        driver.finished = true;
-        driver.clearStall();
-        resolve(result);
-      };
-    });
-    // Quiescence: when a step is blocked, no step callback is executing,
-    // and a macrotask has passed, nothing can progress, so the invocation
-    // suspends. The macrotask lets every microtask chain a completed step
-    // unblocked drain first; checking on the spot would suspend an instance
-    // whose next step is one `await` away from starting.
-    driver.check = () => {
-      if (driver.checkQueued || driver.finished) return;
-      driver.checkQueued = true;
-      setTimeout(() => {
-        driver.checkQueued = false;
-        if (driver.finished || driver.running !== 0) return;
-        if (driver.pauseRequested) {
-          driver.finish({ kind: "pause" });
-          return;
-        }
-        if (driver.blocked.length > 0) {
-          driver.finish({ kind: "suspend" });
-          return;
-        }
-        // No step runs, none is blocked, and run() has not settled: it
-        // awaits something that is not a step. Upstream permits that -- an
-        // un-stepped `await fetch()` between steps is legal, merely
-        // non-durable -- so this is not yet an error; but a promise that
-        // never settles would wedge the alarm handler in silence, with the
-        // instance "running" forever. A grace timer splits the two: if the
-        // same nothing-can-progress state still holds when it fires, the
-        // instance fails loudly. The timer is a plain in-isolate timeout,
-        // not a durable alarm, on purpose: an eviction or a restart replays
-        // run() from the top anyway, so losing the timer loses nothing --
-        // the replay re-enters the same stall and re-arms its own grace.
-        if (driver.stallTimer !== undefined) return;
-        driver.stallTimer = setTimeout(() => {
-          driver.stallTimer = undefined;
-          if (driver.finished || driver.running !== 0 || driver.blocked.length > 0) {
-            return;
-          }
-          driver.finish({
-            kind: "error",
-            error: __wfError(
-              "run() has been awaiting something that is not a step for " +
-                (__WF_STALL_GRACE_MS / 1000) + " seconds while no step is " +
-                "running or blocked; a replay cannot resume this wait, so " +
-                "wrap long async work in step.do",
-            ),
-          });
-        }, __WF_STALL_GRACE_MS);
-      }, 0);
-    };
+    const { driver, outcome } = __wfNewDriver(storage, meta);
     if (
       meta.status !== "running" &&
       !(await settle((current) => {
@@ -9209,24 +9515,27 @@ const __WorkflowCell = (() => {
       return;
     }
     const step = __wfMakeStep(driver);
-    const event = {
-      payload: meta.params,
-      timestamp: new Date(meta.createdMs),
-      instanceId: meta.instanceId,
-      workflowName: meta.workflowName,
-    };
-    // ExecutionContext-shaped, as the WorkflowEntrypoint constructor
-    // documents upstream.
-    const ctx = {
-      waitUntil: __registerWaitUntil,
-      passThroughOnException() {},
-    };
-    (async () => new cls(ctx, __cell.env).run(event, step))().then(
+    __wfStartRun(cls, meta, step).then(
       (value) => driver.finish({ kind: "complete", value }),
       (error) => driver.finish({ kind: "error", error }),
     );
     /*__CELLD_TEST_WORKFLOW_AFTER_RUN_STARTED__*/
     let result = await outcome;
+    // run() can settle while a sibling step callback still runs, and a
+    // terminate({rollback: true}) can land under one. Releasing the drive
+    // then would let compensation start beside a live forward effect, so
+    // wait for the callbacks (each bounded by its step timeout) first. A
+    // callback that finishes before the rollback commits keeps its output.
+    if (driver.running !== 0) {
+      const compensating = transactionSync(storage, (transaction) => {
+        const current = transaction.kv.get("__wf.meta");
+        return current !== undefined && current.generation === meta.generation &&
+          (__wfRollingBack(current) ||
+            (result.kind === "error" &&
+              __wfHasRollbackSteps(transaction, current.generation)));
+      });
+      if (compensating) await driver.idle();
+    }
     // The workflow can catch a rejected step promise, but it cannot turn an
     // engine storage failure into a successful run. Preserve the alarm so
     // the runtime retries over the last committed ledger prefix.
@@ -9303,11 +9612,252 @@ const __WorkflowCell = (() => {
       }
     }
     settle((current, transaction) => {
+      // An unhandled failure with registered rollbacks defers the terminal
+      // status: the request and its wake are one commit, and retention is
+      // armed only when compensation settles, so neither a crash nor expiry
+      // can strand the cleanup.
+      if (__wfHasRollbackSteps(transaction, current.generation)) {
+        current.status = "running";
+        current.rollback = {
+          trigger: "forward_failure",
+          originalTerminalStatus: "errored",
+          originalError: __wfErrorRecord(result.error),
+          phase: "requested",
+        };
+        transaction.setAlarm(Date.now());
+        return;
+      }
       current.status = "errored";
       current.error = __wfErrorRecord(result.error);
       __wfFinishRetention(current, transaction);
       /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
     });
+  }
+  // Rebuild the rollback handlers by replaying run() against the ledger
+  // without running a forward callback. Handlers are closures, so they live
+  // only in the replaying isolate; nothing executable is ever stored. The
+  // replay ends as soon as every pending step has its handler, or when it
+  // can make no further progress; a throw is ordinary control flow here, as
+  // upstream, and a step left without a handler fails the rollback later.
+  async _rehydrate(meta, cls, keys) {
+    const registry = new Map();
+    if (typeof cls !== "function" ||
+        typeof (cls.prototype && cls.prototype.run) !== "function") {
+      return registry;
+    }
+    const { driver, outcome } = __wfNewDriver(this._state.storage, meta);
+    driver.rehydrate = {
+      settled: false,
+      register(key, entry) {
+        if (!keys.has(key) || registry.has(key)) return;
+        registry.set(key, entry);
+        if (registry.size === keys.size) driver.finish({ kind: "covered" });
+      },
+    };
+    const settled = () => {
+      driver.rehydrate.settled = true;
+      driver.check();
+    };
+    __wfStartRun(cls, meta, __wfMakeStep(driver)).then(settled, settled);
+    await outcome;
+    if (driver.storageFailure !== undefined) throw driver.storageFailure;
+    return registry;
+  }
+  // Run the pending compensations, latest-started step first. Every
+  // transition is one commit fenced on this generation still rolling back,
+  // so a delete or a crash between commits leaves the previous checkpoint,
+  // never a half-applied one; the alarm that fired this drive stays armed
+  // until it returns, which is the crash wake.
+  async _driveRollback(meta, cls) {
+    const storage = this._state.storage;
+    const advance = (mutate) => transactionSync(storage, (transaction) => {
+      const current = transaction.kv.get("__wf.meta");
+      if (current === undefined || current.generation !== meta.generation ||
+          !__wfRollingBack(current)) return false;
+      mutate(current, transaction);
+      transaction.kv.put("__wf.meta", current);
+      return true;
+    });
+    // The rollback settles into the status the instance would have had, with
+    // its outcome beside it, and only then starts its retention clock.
+    const finish = (failure, entry, progress) => {
+      advance((current, transaction) => {
+        if (entry !== undefined) transaction.kv.put(entry.rollbackKey, progress);
+        const rollback = { ...current.rollback };
+        delete rollback.refreshFingerprints;
+        current.status = rollback.originalTerminalStatus;
+        if (rollback.trigger === "forward_failure") {
+          current.error = rollback.originalError;
+        }
+        current.rollback = failure === undefined
+          ? { ...rollback, phase: "completed", outcome: "complete" }
+          : {
+            ...rollback,
+            phase: "failed",
+            outcome: "failed",
+            error: __wfErrorRecord(failure),
+          };
+        __wfFinishRetention(current, transaction);
+        /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
+      });
+    };
+    let plan;
+    if (!advance((current, transaction) => {
+      current.rollback.phase = "compensating";
+      plan = __wfRollbackPlan(transaction, current.generation);
+    })) return;
+    const pending = plan.filter((entry) => entry.progress?.status !== "completed");
+    if (pending.length === 0) {
+      finish(undefined);
+      return;
+    }
+    // A persisted backoff deadline survives a restart, so a crash can
+    // neither reset nor skip it. An early wake re-arms it without replaying
+    // run(), whose non-step code would otherwise run on every nudge.
+    const head = pending[0].progress;
+    if (head?.status === "retrying" && head.nextAt > Date.now()) {
+      advance((_current, transaction) => transaction.setAlarm(head.nextAt));
+      return;
+    }
+    const registry = await this._rehydrate(
+      meta,
+      cls,
+      new Set(pending.map((entry) => entry.key)),
+    );
+    const refresh = meta.rollback.refreshFingerprints === true;
+    const cause = __wfReviveError(meta.rollback.originalError);
+    for (const entry of pending) {
+      const label = JSON.stringify(entry.name);
+      const registered = registry.get(entry.key);
+      const progress = entry.progress;
+      const prior = progress?.attempt ?? 0;
+      // A missing or changed handler fails closed: compensating with code
+      // that does not match the step is no safer than skipping it.
+      if (registered === undefined) {
+        const failure = __wfError(
+          `step ${label} needs a rollback, but run() did not register its ` +
+            "handler when replayed; the deployed code no longer matches " +
+            "this instance",
+        );
+        finish(failure, entry, {
+          status: "failed",
+          attempt: prior,
+          error: __wfErrorRecord(failure),
+        });
+        return;
+      }
+      if (!refresh && entry.record.rollbackFingerprint !== undefined &&
+          registered.fingerprint !== entry.record.rollbackFingerprint) {
+        const failure = __wfError(
+          `the rollbackConfig of step ${label} changed since the step ran; ` +
+            "call retryRollback() to compensate under the deployed config",
+        );
+        finish(failure, entry, {
+          status: "failed",
+          attempt: prior,
+          error: __wfErrorRecord(failure),
+        });
+        return;
+      }
+      if (progress?.status === "retrying" && progress.nextAt > Date.now()) {
+        advance((_current, transaction) => transaction.setAlarm(progress.nextAt));
+        return;
+      }
+      const retries = registered.config.retries ?? __wfDefaultRetries();
+      const timeout = registered.config.timeout ?? __WF_DEFAULT_TIMEOUT;
+      const attempt = prior + 1;
+      // The attempt is counted before the handler starts, unlike a forward
+      // attempt: a handler that crashes the isolate every time must still
+      // exhaust its retries rather than loop on one attempt forever. This
+      // commit stays outside the handler's catch, so a storage failure
+      // retries the alarm instead of spending the step's retry budget.
+      if (!advance((_current, transaction) => {
+        transaction.kv.put(entry.rollbackKey, { status: "running", attempt });
+        if (refresh) {
+          transaction.kv.put(entry.key, {
+            ...entry.record,
+            rollbackFingerprint: registered.fingerprint,
+          });
+        }
+      })) return;
+      let failed = false;
+      let error;
+      try {
+        const timeoutMs = __wfDuration(
+          timeout,
+          `the rollback timeout of step ${label}`,
+        );
+        await __wfTimeout(
+          __wfEnterStep(entry.name, async () =>
+            registered.handler({
+              ctx: registered.context,
+              error: cause,
+              output: registered.output,
+            })),
+          timeoutMs,
+          entry.name,
+          attempt,
+        );
+      } catch (caught) {
+        failed = true;
+        error = caught;
+      }
+      if (!failed) {
+        if (!advance((_current, transaction) => {
+          transaction.kv.put(entry.rollbackKey, { status: "completed", attempt });
+        })) return;
+        continue;
+      }
+      let nextAt;
+      if (!__wfPermanentFailure(error, attempt, retries)) {
+        try {
+          nextAt = await __wfRetryAt(retries, attempt, entry.name, {
+            ctx: __wfStepContext(entry.name, entry.count, attempt, retries, timeout),
+            error,
+          });
+        } catch (caught) {
+          error = caught;
+        }
+      }
+      // A terminal failure halts the chain: the earlier steps keep their
+      // effects and the instance reports the failure for reconciliation.
+      if (nextAt === undefined) {
+        finish(error, entry, {
+          status: "failed",
+          attempt,
+          error: __wfErrorRecord(error),
+        });
+        return;
+      }
+      advance((_current, transaction) => {
+        transaction.kv.put(entry.rollbackKey, {
+          status: "retrying",
+          attempt,
+          nextAt,
+          error: __wfErrorRecord(error),
+        });
+        transaction.setAlarm(nextAt);
+      });
+      return;
+    }
+    finish(undefined);
+  }
+  // terminate({rollback: true}) and retryRollback() resolve once the
+  // compensation they requested settles, as upstream's terminate does, but
+  // wait at most __WF_ROLLBACK_WAIT_MS. The work runs in the alarm drive and
+  // is durable without the caller, while an open call would hold a node
+  // drain to its deadline and stay open across hours of handler backoff.
+  // Resolving says nothing about the outcome either way; status() does.
+  async _wfAwaitRollback(generation) {
+    const deadline = Date.now() + __WF_ROLLBACK_WAIT_MS;
+    for (let delay = 10; Date.now() < deadline; delay = Math.min(delay * 2, 500)) {
+      const meta = await this._state.storage.get("__wf.meta");
+      if (meta === undefined || meta.generation !== generation) {
+        throw __wfError("the instance was deleted before its rollback finished");
+      }
+      if (!__wfRollingBack(meta)) return;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
   }
   };
 })();
@@ -9369,13 +9919,11 @@ class WorkflowInstance {
     return await this._stub.__wfStatus();
   }
   async terminate(options) {
-    if (options && options.rollback) {
-      throw __wfError(
-        "terminate({rollback: true}) is not implemented in celld; step " +
-          "rollbackOptions are not implemented, so no handler could run",
-      );
-    }
-    await this._stub.__wfTerminate();
+    await this._stub.__wfTerminate(__wfTerminateOptions(options));
+  }
+  // celld extension; upstream has no way to resume a halted rollback.
+  async retryRollback() {
+    await this._stub.__wfRetryRollback();
   }
   async sendEvent(options) {
     await this._stub.__wfSendEvent(__wfEventOptions(options));

@@ -548,6 +548,12 @@ release, so keep operator tooling and celld releases together.
   promptly. Until every node runs v0.6.3, a v0.6.2 node can still acquire a
   cell whose ownership record was lost and start the cell with an empty
   database. A rollback to v0.6.2 can also roll.
+- **v0.6.3 to the next release: rolling.** Until every node runs the new
+  release, do not deploy a Workflow that passes rollback options to
+  `step.do()` or calls `terminate({ rollback: true })`: a v0.6.3 node
+  rejects both, and it can settle an instance whose rollback is still in
+  progress. Before a rollback to v0.6.3, let every Workflow rollback finish,
+  or delete the instances that are still rolling back.
 
 ## Diagnose a fleet
 
