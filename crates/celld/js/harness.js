@@ -8676,6 +8676,7 @@ const __wfMakeStep = (driver) => {
           name,
           attempt,
         );
+        /*__CELLD_TEST_WORKFLOW_FAILPOINT:forward.after_callback__*/
         if (value !== undefined) {
           __wfCheckValue(value, `the return value of step ${JSON.stringify(name)}`);
         }
@@ -9309,7 +9310,10 @@ const __WorkflowCell = (() => {
       /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
       return undefined;
     });
-    if (awaiting !== undefined) await this._wfAwaitRollback(awaiting);
+    if (awaiting !== undefined) {
+      /*__CELLD_TEST_WORKFLOW_FAILPOINT:rollback.requested__*/
+      await this._wfAwaitRollback(awaiting);
+    }
   }
   // celld extension: resume a rollback that halted on a failed compensation,
   // under the deployed code. Completed compensations stay done; the halted
@@ -9632,6 +9636,7 @@ const __WorkflowCell = (() => {
       __wfFinishRetention(current, transaction);
       /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
     });
+    /*__CELLD_TEST_WORKFLOW_FAILPOINT:rollback.requested__*/
   }
   // Rebuild the rollback handlers by replaying run() against the ledger
   // without running a forward callback. Handlers are closures, so they live
@@ -9766,6 +9771,21 @@ const __WorkflowCell = (() => {
       const retries = registered.config.retries ?? __wfDefaultRetries();
       const timeout = registered.config.timeout ?? __WF_DEFAULT_TIMEOUT;
       const attempt = prior + 1;
+      // Attempts that never returned -- their node crashed mid-handler --
+      // count against the budget too, so a handler that takes its node down
+      // every time ends the rollback instead of looping on restarts.
+      if (attempt > retries.limit + 1) {
+        const failure = __wfError(
+          `the rollback handler of step ${label} did not return in ` +
+            `${prior} attempts; the node running it stopped mid-attempt`,
+        );
+        finish(failure, entry, {
+          status: "failed",
+          attempt: prior,
+          error: __wfErrorRecord(failure),
+        });
+        return;
+      }
       // The attempt is counted before the handler starts, unlike a forward
       // attempt: a handler that crashes the isolate every time must still
       // exhaust its retries rather than loop on one attempt forever. This
@@ -9773,6 +9793,7 @@ const __WorkflowCell = (() => {
       // retries the alarm instead of spending the step's retry budget.
       if (!advance((_current, transaction) => {
         transaction.kv.put(entry.rollbackKey, { status: "running", attempt });
+        /*__CELLD_TEST_WORKFLOW_FAILPOINT:rollback.running_commit__*/
         if (refresh) {
           transaction.kv.put(entry.key, {
             ...entry.record,
@@ -9780,6 +9801,12 @@ const __WorkflowCell = (() => {
           });
         }
       })) return;
+      // A commit is durable only once proven, and a crash can lose an
+      // unproven one. Prove the counted attempt before the handler runs, or
+      // a handler that crashes its node would restart at the same attempt
+      // forever. A failed proof throws, and the alarm retries the drive.
+      await storage.sync();
+      /*__CELLD_TEST_WORKFLOW_FAILPOINT:rollback.before_handler__*/
       let failed = false;
       let error;
       try {
@@ -9803,9 +9830,11 @@ const __WorkflowCell = (() => {
         error = caught;
       }
       if (!failed) {
+        /*__CELLD_TEST_WORKFLOW_FAILPOINT:rollback.after_handler__*/
         if (!advance((_current, transaction) => {
           transaction.kv.put(entry.rollbackKey, { status: "completed", attempt });
         })) return;
+        /*__CELLD_TEST_WORKFLOW_FAILPOINT:rollback.after_step__*/
         continue;
       }
       let nextAt;
@@ -9840,6 +9869,7 @@ const __WorkflowCell = (() => {
       });
       return;
     }
+    /*__CELLD_TEST_WORKFLOW_FAILPOINT:rollback.before_finish__*/
     finish(undefined);
   }
   // terminate({rollback: true}) and retryRollback() resolve once the

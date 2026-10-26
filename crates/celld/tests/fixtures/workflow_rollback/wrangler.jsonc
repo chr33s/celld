@@ -1,0 +1,9 @@
+{
+  "name": "workflow-rollback",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-08-18",
+  "durable_objects": { "bindings": [{ "name": "LOG", "class_name": "Log" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Log"] }],
+  "workflows": [{ "binding": "WF", "name": "saga", "class_name": "Saga" }]
+}
